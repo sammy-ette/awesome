@@ -22,8 +22,11 @@ shape.update = {}
 -- @tparam client c The client whose shape should be retrieved
 -- @tparam string shape_name Either "bounding" or "clip"
 function shape.get_transformed(c, shape_name)
-    local border = shape_name == "bounding" and c.border_width or 0
-    local shape_img = surface.load_silently(c["client_shape_" .. shape_name], false)
+    local border = (shape_name == "bounding" or shape_name == "input") and c.border_width or 0
+    -- Consider input shapes ONLY the existence is confirmed.
+    -- This is because we can not detect the existence of input shapes in normal ways.
+    -- Currently `has_client_input_shape` is only set on shape_client_input signals.
+    local shape_img = (c.has_client_input_shape or shape_name ~= "input") and surface.load_silently(c["client_shape_" .. shape_name], false)
     local _shape = c._shape
     if not (shape_img or _shape) then return end
 
@@ -95,6 +98,7 @@ end
 function shape.update.all(c)
     shape.update.bounding(c)
     shape.update.clip(c)
+    shape.update.input(c)
 end
 
 --- Update a client's bounding shape from the shape the client set itself.
@@ -121,8 +125,21 @@ function shape.update.clip(c)
     end
 end
 
+--- Update a client's input shape from the shape the client set itself.
+-- @function awful.client.shape.update.input
+-- @client c The client to act on
+function shape.update.input(c)
+    local res = shape.get_transformed(c, "input")
+    c.shape_input = res and res._native
+    -- Free memory
+    if res then
+        res:finish()
+    end
+end
+
 capi.client.connect_signal("property::shape_client_bounding", shape.update.bounding)
 capi.client.connect_signal("property::shape_client_clip", shape.update.clip)
+capi.client.connect_signal("property::shape_client_input", function (c) c.has_client_input_shape = true; shape.update.input(c) end)
 capi.client.connect_signal("property::size", shape.update.all)
 capi.client.connect_signal("property::border_width", shape.update.all)
 
