@@ -2516,6 +2516,12 @@ client_resize_do(client_t *c, area_t geometry)
         area.y += geometry.y;
         if (c->fullscreen)
             area.width = area.height = 0;
+        /* Force the surface update even if the size doesn't
+         * change. Otherwise the titlebar could be stale (especially
+         * for right/bottom bars). */
+        if (area.width == drawable->geometry.width &&
+            area.height == drawable->geometry.height)
+            (*drawable->refresh_callback)(drawable->refresh_data);
         drawable_set_geometry(L, -1, area);
 
         /* Pop the client and the drawable */
