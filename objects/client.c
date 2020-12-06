@@ -2941,6 +2941,10 @@ client_unmanage(client_t *c, client_unmanage_t reason)
 {
     lua_State *L = globalconf_get_lua_State();
 
+    luaA_object_push(L, c);
+    luaA_object_emit_signal(L, -1, "before::unmanage", 0);
+    lua_pop(L, 1);
+
     /* Reset transient_for attributes of windows that might be referring to us */
     foreach(_tc, globalconf.clients)
     {
