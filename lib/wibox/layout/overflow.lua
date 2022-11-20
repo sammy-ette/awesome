@@ -275,7 +275,7 @@ end
 
 --- Scroll the layout's content by `amount * step`.
 --
--- A positive amount scroll down/right, a negative amount scrolls up/left.
+-- A positive amount scrolls down/right, a negative amount scrolls up/left.
 --
 -- The amount of units scrolled is affected by `step`.
 --
@@ -476,6 +476,20 @@ function overflow:get_scrollbar_widget()
     return self._private.scrollbar_widget
 end
 
+
+function overflow:reset()
+    self._private.widgets = {}
+    self._private.scroll_factor = 0
+
+    local scrollbar_widget = separator({ shape = gshape.rectangle })
+    apply_scrollbar_mouse_signal(self, scrollbar_widget)
+    self._private.scrollbar_widget = scrollbar_widget
+
+    self:emit_signal("widget::layout_changed")
+    self:emit_signal("widget::reset")
+    self:emit_signal("widget::reseted")
+end
+
 local function new(dir, ...)
     local ret = fixed[dir](...)
 
@@ -530,7 +544,7 @@ end
 -- widgets exceeds the height available whithin the layout's outer container
 -- a scrollbar will be added and scrolling behavior enabled.
 -- @tparam widget ... Widgets that should be added to the layout.
--- @constructorfct wibox.layout.overflow.horizontal
+-- @constructorfct wibox.layout.overflow.vertical
 function overflow.vertical(...)
     return new("vertical", ...)
 end
