@@ -522,7 +522,7 @@ end
 -- @see filter
 -- @see awful.widget.taglist.source.for_screen
 
---- A templete used to genetate the individual tag widgets.
+--- A template used to generate the individual tag widgets.
 --
 -- @property widget_template
 -- @tparam[opt=nil] template|nil widget_template
@@ -711,6 +711,7 @@ function taglist.new(args, filter, buttons, style, update_function, base_widget)
         tag.attached_connect_signal(nil, "property::screen", ut)
         tag.attached_connect_signal(nil, "property::index", ut)
         tag.attached_connect_signal(nil, "property::urgent", ut)
+        tag.attached_connect_signal(nil, "property::volatile", ut)
         capi.client.connect_signal("property::screen", function(c, old_screen)
             u(c.screen)
             u(old_screen)
