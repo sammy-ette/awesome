@@ -1373,6 +1373,17 @@ lua_class_t client_class;
  */
 
 /**
+ * The client's input shape as set by the program as a (native) cairo surface.
+ *
+ * **Signal:**
+ *
+ *  * *property::shape\_client\_input*
+ *
+ * @property client_shape_input
+ * @param surface
+ */
+
+/**
  * The FreeDesktop StartId.
  *
  * When a client is spawned (like using a terminal or `awful.spawn`, a startup
@@ -2505,6 +2516,12 @@ client_resize_do(client_t *c, area_t geometry)
         area.y += geometry.y;
         if (c->fullscreen)
             area.width = area.height = 0;
+        /* Force the surface update even if the size doesn't
+         * change. Otherwise the titlebar could be stale (especially
+         * for right/bottom bars). */
+        if (area.width == drawable->geometry.width &&
+            area.height == drawable->geometry.height)
+            (*drawable->refresh_callback)(drawable->refresh_data);
         drawable_set_geometry(L, -1, area);
 
         /* Pop the client and the drawable */
@@ -2923,6 +2940,10 @@ void
 client_unmanage(client_t *c, client_unmanage_t reason)
 {
     lua_State *L = globalconf_get_lua_State();
+
+    luaA_object_push(L, c);
+    luaA_object_emit_signal(L, -1, "before::unmanage", 0);
+    lua_pop(L, 1);
 
     /* Reset transient_for attributes of windows that might be referring to us */
     foreach(_tc, globalconf.clients)
@@ -4307,6 +4328,22 @@ luaA_client_set_shape_clip(lua_State *L, client_t *c)
     return 0;
 }
 
+/** Get the client's child window input shape.
+ * \param L The Lua VM state.
+ * \param client The client object.
+ * \return The number of elements pushed on stack.
+ */
+static int
+luaA_client_get_client_shape_input(lua_State *L, client_t *c)
+{
+    cairo_surface_t *surf = xwindow_get_shape(c->window, XCB_SHAPE_SK_INPUT);
+    if (!surf)
+        return 0;
+    /* lua has to make sure to free the ref or we have a leak */
+    lua_pushlightuserdata(L, surf);
+    return 1;
+}
+
 /** Get the client's frame window input shape.
  * \param L The Lua VM state.
  * \param client The client object.
@@ -4672,6 +4709,10 @@ client_class_setup(lua_State *L)
     luaA_class_add_property(&client_class, "client_shape_clip",
                             NULL,
                             (lua_class_propfunc_t) luaA_client_get_client_shape_clip,
+                            NULL);
+    luaA_class_add_property(&client_class, "client_shape_input",
+                            NULL,
+                            (lua_class_propfunc_t) luaA_client_get_client_shape_input,
                             NULL);
     luaA_class_add_property(&client_class, "first_tag",
                             NULL,
