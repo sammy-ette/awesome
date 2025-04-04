@@ -3,10 +3,10 @@ name: Build & Test
 on:
   # Trigger on push to branches `master` and `3.5`.
   push:
-    branches: [ master, 3.5 ]
+    branches: [master, 3.5]
   # Trigger on pull request events for PRs that have `master` as their target branch
   pull_request:
-    branches: [ master ]
+    branches: [master]
 
   # Allow running the workflow manually
   workflow_dispatch:
@@ -75,15 +75,15 @@ jobs:
       LUAINCLUDE: ${{ matrix.lua_include || format('/usr/include/lua{0}', matrix.lua_version) }}
       LUALIBRARY: ${{ matrix.lua_library || format('/usr/lib/x86_64-linux-gnu/liblua{0}.so', matrix.lua_version) }}
       TESTS_SCREEN_SIZE: ${{ matrix.tests_screen_size }}
-      TEST_TIMEOUT: '100'
-      CI: 'true'
+      TEST_TIMEOUT: "100"
+      CI: "true"
 
     steps:
       # Create a cache invalidation key based on the current year + week.
       # This way, packages will be checked for updates once every week.
       - name: Get Date
         id: get-date
-        run: echo "::set-output name=date::$(/bin/date -u "+%Y%W")"
+        run: echo "date=$(/bin/date -u "+%Y%W")" >> $GITHUB_OUTPUT
 
       - name: Cache apt packages
         id: cache-apt
@@ -194,14 +194,16 @@ jobs:
         uses: actions/cache@v2
         with:
           path: /tmp/xcb-errors
-          key: ${{ github.workflow }}-${{ runner.os }}-xcb-errors-1.0
+          key: ${{ github.workflow }}-${{ runner.os }}-xcb-errors-1.0.1
 
       - name: Install fresh xcb-errors
         if: steps.cache-xcb-errors.outputs.cache-hit != 'true'
         run: |
-          git clone --recursive --depth 1 --branch 1.0 https://gitlab.freedesktop.org/xorg/lib/libxcb-errors.git /tmp/xcb-errors
+          wget -O /tmp/xcb-errors.tar.xz https://xorg.freedesktop.org/archive/individual/lib/xcb-util-errors-1.0.1.tar.xz
+          mkdir /tmp/xcb-errors
+          tar -xf /tmp/xcb-errors.tar.xz -C /tmp/xcb-errors/ --strip-components=1
           cd /tmp/xcb-errors
-          ./autogen.sh --prefix=/usr
+          ./configure --prefix=/usr
           make
           sudo make install
 
@@ -239,10 +241,6 @@ jobs:
       - name: Install cluacov rock
         if: matrix.coverage
         run: sudo -H luarocks install cluacov
-
-      - name: Install codecov.io uploader
-        if: matrix.coverage == 'codecov'
-        run: wget -O /tmp/codecov-bash https://codecov.io/bash
 
       # Check out repository to ${{ github.workspace }}
       # Automatically picks the current branch/PR
@@ -308,7 +306,7 @@ jobs:
         run: cd "${{ github.workspace }}/build" && make check-unit
 
       - name: Run examples tests
-        run: cd "${{ github.workspace }}/build" && make check-examples
+        run: cd "${{ github.workspace }}/build" && make check-examples -j24
 
       - name: Run requires tests
         if: matrix.coverage
@@ -317,13 +315,12 @@ jobs:
       - name: Run themes tests
         run: cd "${{ github.workspace }}/build" && make check-themes
 
-      - name: Upload Lua code coverage report
+      - name: Generate Lua coverage report
         if: matrix.coverage == 'codecov'
         run: |
           luacov
-          bash /tmp/codecov-bash -f build/luacov.report.out -X gcov -X coveragepy -F luacov
 
-      - name: Upload C code coverage report
+      - name: Generate C coverage report
         if: matrix.coverage == 'codecov'
         run: |
           # Report coverage for each .gcno file separately.
@@ -343,8 +340,21 @@ jobs:
             find "gcov.$i" -maxdepth 1 -type f -name '#usr#*.gcov' -delete
           done
 
-          # Upload to Codecov.
-          bash /tmp/codecov-bash -X gcov -X coveragepy -F gcov
+      - name: Upload Lua code coverage report
+        if: matrix.coverage == 'codecov'
+        uses: codecov/codecov-action@v3
+        with:
+          files: "${{ github.workspace }}/build/luacov.report.out"
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload C code coverage report
+        if: matrix.coverage == 'codecov'
+        uses: codecov/codecov-action@v3
+        with:
+          files: "${{ github.workspace }}/build/*/*.gcov"
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       # `check-qa` is the only test that doesn't get a coverage report, so it has to run after all of that.
       - name: Run qa tests

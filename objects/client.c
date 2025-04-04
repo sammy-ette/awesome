@@ -1386,7 +1386,7 @@ lua_class_t client_class;
 /**
  * The FreeDesktop StartId.
  *
- * When a client is spawned (like using a terminal or `awful.spawn`, a startup
+ * When a client is spawned (like using a terminal or `awful.spawn`), a startup
  * notification identifier is created. When the client is created, this
  * identifier remain the same. This allow to match a spawn event to an actual
  * client.
@@ -3031,6 +3031,8 @@ client_unmanage(client_t *c, client_unmanage_t reason)
 
     if(reason != CLIENT_UNMANAGE_DESTROYED)
     {
+        xwindow_buttons_grab(c->window, &(button_array_t){ .len = 0 });
+        xwindow_grabkeys(c->window, &(key_array_t){ .len = 0 });
         area_t geometry = client_get_undecorated_geometry(c);
         xcb_unmap_window(globalconf.connection, c->window);
         xcb_reparent_window(globalconf.connection, c->window, globalconf.screen->root,

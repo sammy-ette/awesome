@@ -1,0 +1,10 @@
+Uncovered wallpaper #1 area:	258	97	96	160
+Uncovered wallpaper #1 area:	97	129	160	50
+Uncovered wallpaper #1 area:	146	129	111	96
+Uncovered wallpaper #1 area:	0	97	50	160
+Uncovered wallpaper #1 area:	0	97	96	82
+Uncovered wallpaper #2 area:	370	0	160	96
+Uncovered wallpaper #2 area:	370	258	160	96
+Uncovered wallpaper #2 area:	402	97	18	160
+Uncovered wallpaper #2 area:	402	97	96	50
+Uncovered wallpaper #2 area:	402	243	96	14
