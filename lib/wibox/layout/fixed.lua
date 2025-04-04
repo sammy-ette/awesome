@@ -367,7 +367,7 @@ function fixed:fit(context, orig_width, orig_height)
         local is_enough
 
         if is_y then
-            is_enough = h > 0 and height_left >= h
+            is_enough = height_left >= h
 
             if is_enough then
                 used_max = math.max(used_max, w)
@@ -375,7 +375,7 @@ function fixed:fit(context, orig_width, orig_height)
                 height_left = height_left - h
             end
         else
-            is_enough = w > 0 and width_left >= w
+            is_enough = width_left >= w
 
             if is_enough then
                 used_max = math.max(used_max, h)
