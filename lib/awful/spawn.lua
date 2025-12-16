@@ -149,7 +149,7 @@
 --
 -- If the intent is to open a file/document, then it is recommended to use the
 -- following standard command. The default application will be selected
--- according to the [Shared MIME-info Database](https://specifications.freedesktop.org/shared-mime-info-spec/shared-mime-info-spec-latest.html)
+-- according to the [Shared MIME-info Database](https://specifications.freedesktop.org/shared-mime-info-spec/latest/)
 -- specification. The `xdg-utils` package provided by most distributions
 -- includes the `xdg-open` command:
 --
@@ -160,7 +160,7 @@
 -- [ARCH Linux Wiki](https://wiki.archlinux.org/index.php/default_applications).
 --
 -- If you wish to change how the default applications behave, then consult the
--- [Desktop Entry](https://specifications.freedesktop.org/desktop-entry-spec/desktop-entry-spec-latest.html)
+-- [Desktop Entry](https://specifications.freedesktop.org/desktop-entry-spec/latest/)
 -- specification.
 --
 -- Spawning applications with specific properties
@@ -225,6 +225,7 @@ local capi =
 }
 local lgi = require("lgi")
 local Gio = lgi.Gio
+local GioUnix = lgi.GioUnix
 local GLib = lgi.GLib
 local util   = require("awful.util")
 local gtable = require("gears.table")
@@ -418,11 +419,11 @@ function spawn.with_line_callback(cmd, callbacks)
         end
     end
     if have_stdout then
-        spawn.read_lines(Gio.UnixInputStream.new(stdout, true),
+        spawn.read_lines(GioUnix.InputStream.new(stdout, true),
                 stdout_callback, step_done, true)
     end
     if have_stderr then
-        spawn.read_lines(Gio.UnixInputStream.new(stderr, true),
+        spawn.read_lines(GioUnix.InputStream.new(stderr, true),
                 stderr_callback, step_done, true)
     end
     assert(stdin == nil)

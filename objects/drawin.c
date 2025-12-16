@@ -455,7 +455,7 @@ drawin_allocator(lua_State *L)
                           | XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_EXPOSURE
                           | XCB_EVENT_MASK_PROPERTY_CHANGE,
                           globalconf.default_cmap,
-                          xcursor_new(globalconf.cursor_ctx, xcursor_font_fromstr(w->cursor))
+                          xcursor_new(&globalconf.cursor_cache, globalconf.cursor_ctx, w->cursor)
                       });
     if (globalconf.is_compositing)
         xcb_composite_redirect_subwindows(globalconf.connection, w->window, XCB_COMPOSITE_REDIRECT_MANUAL);
@@ -649,10 +649,9 @@ luaA_drawin_set_cursor(lua_State *L, drawin_t *drawin)
     const char *buf = luaL_checkstring(L, -1);
     if(buf)
     {
-        uint16_t cursor_font = xcursor_font_fromstr(buf);
-        if(cursor_font)
+        xcb_cursor_t cursor = xcursor_new(&globalconf.cursor_cache, globalconf.cursor_ctx, buf);
+        if(cursor)
         {
-            xcb_cursor_t cursor = xcursor_new(globalconf.cursor_ctx, cursor_font);
             p_delete(&drawin->cursor);
             drawin->cursor = a_strdup(buf);
             xwindow_set_cursor(drawin->window, cursor);
