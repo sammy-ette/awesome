@@ -4,7 +4,6 @@
 ---------------------------------------------------------------------------
 
 local matrix = require("gears.matrix")
-local cairo = require("lgi").cairo
 
 describe("gears.matrix", function()
     local function round(n)
@@ -135,14 +134,14 @@ describe("gears.matrix", function()
         assert.is.equal(expected, tostring(m))
     end)
 
-    it("from_cairo_matrix", function()
+    it("from_skia_matrix", function()
         local m1 = matrix.create_translate(2, 3)
-        local m2 = matrix.from_cairo_matrix(cairo.Matrix.create_translate(2, 3))
+        local m2 = matrix.from_skia_matrix { xx = 1, yx = 0, xy = 0, yy = 1, x0 = 2, y0 = 3 }
         assert.is.equal(m1, m2)
     end)
 
-    it("to_cairo_matrix", function()
-        local m = matrix.create_scale(3, 4):to_cairo_matrix()
+    it("to_skia_matrix", function()
+        local m = matrix.create_scale(3, 4):to_skia_matrix()
         assert.is.equal(3, m.xx)
         assert.is.equal(0, m.xy)
         assert.is.equal(0, m.yx)

@@ -31,8 +31,8 @@
 -- @DOC_wibox_container_border_titlebar1_EXAMPLE@
 --
 -- This container is like every other widgets. It is possible to override the
--- Cairo drawing functions. This is very useful here to create custom borders
--- using cairo while still re-using the internal geometry handling code.
+-- Skia drawing functions. This is very useful here to create custom borders
+-- while still re-using the internal geometry handling code.
 --
 -- @DOC_wibox_container_border_custom_draw1_EXAMPLE@
 --
@@ -46,7 +46,7 @@ local gtable   = require("gears.table")
 local imagebox = require("wibox.widget.imagebox")
 local base     = require("wibox.widget.base")
 local gsurface = require("gears.surface")
-local cairo    = require("lgi").cairo
+local skia     = require("skia")
 
 local components = {
     "top_left", "top", "top_right", "right", "bottom_right", "bottom",
@@ -110,42 +110,20 @@ local function setup_origin_common(self, ctx)
 
     local img = self._private.border_image
 
-    -- Try SVG first.
-    local style  = imagebox._get_stylesheet(self, self._private.border_image_stylesheet)
-    local handle = type(img) == "string" and imagebox._load_rsvg_handle(img, style) or nil
+    origin = gsurface(self._private.border_image)
 
-    if handle then
-        if style then
-            handle:set_stylesheet(style)
-        end
-        handle:set_dpi(self.border_image_dpi or ctx.dpi)
-        local dim = handle:get_dimensions()
+    local err1, _origin_w = pcall(function() return origin:get_width() end)
+    local err2, _origin_h = pcall(function() return origin:get_height() end)
 
-        if dim.width > 0 and dim.height > 0 then
-            origin_w, origin_h = dim.width, dim.height
-
-            origin = cairo.ImageSurface(cairo.Format.ARGB32, origin_w, origin_h)
-            local cr = cairo.Context(origin)
-            handle:render_cairo(cr)
-        end
-    end
-
-    if not origin then
-        origin = gsurface(self._private.border_image)
-
-        local err1, _origin_w = pcall(function() return origin:get_width() end)
-        local err2, _origin_h = pcall(function() return origin:get_height() end)
-
-        if err1 and err2 then
-            origin_w, origin_h = _origin_w, _origin_h
-        end
+    if err1 and err2 then
+        origin_w, origin_h = _origin_w, _origin_h
     end
 
     return {
         width   = origin_w,
         height  = origin_h,
         surface = origin,
-        handle  = handle
+        handle  = nil
     }
 end
 
@@ -334,35 +312,35 @@ local function slice(self, ctx, borders)
         scale_w, scale_h = scale, scale
     end
 
-    local ARGB32 = cairo.Format.ARGB32
+    local ARGB32 = skia.Format.ARGB32
 
-    ibs.top_left     = cairo.ImageSurface(ARGB32, borders.left[1], borders.top[2])
-    ibs.top          = cairo.ImageSurface(ARGB32, md.width - borders.left[1] - borders.right[1], borders.top[2])
-    ibs.top_right    = cairo.ImageSurface(ARGB32, borders.right[1], borders.top[2])
-    ibs.right        = cairo.ImageSurface(ARGB32, borders.right[1], md.height - borders.top[2] - borders.bottom[2])
-    ibs.bottom_right = cairo.ImageSurface(ARGB32, borders.right[1], borders.bottom[2])
-    ibs.bottom_left  = cairo.ImageSurface(ARGB32, borders.left[1], borders.bottom[2])
-    ibs.left         = cairo.ImageSurface(ARGB32, borders.left[1], md.height - borders.top[2] - borders.bottom[2])
-    ibs.bottom = cairo.ImageSurface(
+    ibs.top_left     = skia.ImageSurface(ARGB32, borders.left[1], borders.top[2])
+    ibs.top          = skia.ImageSurface(ARGB32, md.width - borders.left[1] - borders.right[1], borders.top[2])
+    ibs.top_right    = skia.ImageSurface(ARGB32, borders.right[1], borders.top[2])
+    ibs.right        = skia.ImageSurface(ARGB32, borders.right[1], md.height - borders.top[2] - borders.bottom[2])
+    ibs.bottom_right = skia.ImageSurface(ARGB32, borders.right[1], borders.bottom[2])
+    ibs.bottom_left  = skia.ImageSurface(ARGB32, borders.left[1], md.height - borders.top[2] - borders.bottom[2])
+    ibs.left         = skia.ImageSurface(ARGB32, borders.left[1], md.height - borders.top[2] - borders.bottom[2])
+    ibs.bottom = skia.ImageSurface(
         ARGB32,
         md.width - borders.left[1] - borders.right[1],
         borders.bottom[2]
     )
-    ibs.fill = cairo.ImageSurface(
+    ibs.fill = skia.ImageSurface(
         ARGB32,
         md.width - borders.left[1] - borders.right[1],
         md.height - borders.top[2]  - borders.bottom[2]
     )
 
     for _, position in ipairs(components) do
-        crs[position] = cairo.Context(ibs[position])
+        crs[position] = skia.Context(ibs[position])
     end
 
     if scale_w > 1 or scale_h > 1 then
         md.width, md.height = math.ceil(md.width * scale_w), math.ceil(md.height * scale_h)
 
-        local new_origin = cairo.ImageSurface(ARGB32, md.width, md.height)
-        local slice_cr = cairo.Context(new_origin)
+        local new_origin = skia.ImageSurface(ARGB32, md.width, md.height)
+        local slice_cr = skia.Context(new_origin)
 
         slice_cr:set_source_surface(md.surface)
         slice_cr:scale(scale_w, scale_h)

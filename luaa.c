@@ -79,7 +79,6 @@
 #include <xcb/xcb_atom.h>
 #include <xcb/xcb_aux.h>
 
-#ifdef WITH_SKIA_VULKAN
 #include "render/skia/skia_backend.h"
 #include "render/skia/skia_lua.h"
 
@@ -296,7 +295,6 @@ luaA_skia_setup(lua_State *L)
     luaA_skia_setup_require(L);
     awesome_skia_lua_extend(L);
 }
-#endif
 #include "xkb_utf32_to_keysym_compat.c"
 
 #include <unistd.h> /* for gethostname() */
@@ -522,28 +520,28 @@ luaA_sync(lua_State *L)
     return 0;
 }
 
-/** Translate a GdkPixbuf to a cairo image surface..
+/** Translate a GdkPixbuf to a Skia image.
  *
  * @param pixbuf The pixbuf as a light user datum.
  * @param path The pixbuf origin path
- * @treturn gears.surface A cairo surface as light user datum.
+ * @treturn skia.Image A Skia image.
  * @staticfct pixbuf_to_surface
  */
 static int
 luaA_pixbuf_to_surface(lua_State *L)
 {
     GdkPixbuf *pixbuf = (GdkPixbuf *) lua_touserdata(L, 1);
-    cairo_surface_t *surface = draw_surface_from_pixbuf(pixbuf);
+    awesome_skia_image_t *image = draw_image_from_pixbuf(pixbuf);
 
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surface);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
 /** Load an image from a given path.
  *
  * @tparam string name The file name.
- * @treturn gears.surface A cairo surface as light user datum.
+ * @treturn skia.Image A Skia image.
  * @treturn nil|string The error message, if any.
  * @staticfct load_image
  */
@@ -556,16 +554,16 @@ luaA_load_image(lua_State *L)
 
     GError *error = NULL;
     const char *filename = luaL_checkstring(L, 1);
-    cairo_surface_t *surface = draw_load_image(L, filename, &error);
-    if (!surface) {
+    awesome_skia_image_t *image = draw_load_skia_image(filename, &error);
+    if (!image) {
         lua_pushnil(L);
         lua_pushstring(L, error->message);
         g_error_free(error);
         return 2;
     }
 
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surface);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -1348,9 +1346,7 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
 
     luaA_fixups(L);
 
-#ifdef WITH_SKIA_VULKAN
     luaA_skia_setup(L);
-#endif
 
     luaA_object_setup(L);
 

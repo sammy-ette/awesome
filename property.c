@@ -270,10 +270,10 @@ property_get_net_wm_icon(client_t *c)
 void
 property_update_net_wm_icon(client_t *c, xcb_get_property_cookie_t cookie)
 {
-    cairo_surface_array_t array = ewmh_window_icon_get_reply(cookie);
+    awesome_skia_image_array_t array = ewmh_window_icon_get_reply(cookie);
     if (array.len == 0)
     {
-        cairo_surface_array_wipe(&array);
+        awesome_skia_image_array_wipe(&array);
         return;
     }
     c->have_ewmh_icon = true;

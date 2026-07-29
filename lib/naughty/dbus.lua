@@ -12,11 +12,11 @@ local pairs = pairs
 local type = type
 local string = string
 local capi = { awesome = awesome }
-local gsurface = require("gears.surface")
 local gdebug  = require("gears.debug")
 local protected_call = require("gears.protected_call")
 local lgi = require("lgi")
-local cairo, Gio, GLib, GObject = lgi.cairo, lgi.Gio, lgi.GLib, lgi.GObject
+local skia = require("skia")
+local Gio, GLib, GObject = lgi.Gio, lgi.GLib, lgi.GObject
 
 local schar = string.char
 local sbyte = string.byte
@@ -88,10 +88,9 @@ local function convert_icon(w, h, rowstride, channels, data)
         h = 0
     end
 
-    local format = cairo.Format[channels == 4 and 'ARGB32' or 'RGB24']
-
-    -- Figure out some stride magic (cairo dictates rowstride)
-    local stride = cairo.Format.stride_for_width(format, w)
+    -- Skia consumes packed BGRA, which is also the target byte order used by
+    -- the renderer's image upload path.
+    local stride = 4 * w
     local append = schar(0):rep(stride - 4 * w)
     local offset = 0
 
@@ -114,13 +113,7 @@ local function convert_icon(w, h, rowstride, channels, data)
     end
 
     local pixels = tcat(rows)
-    local surf = cairo.ImageSurface.create_for_data(pixels, format, w, h, stride)
-
-    -- The surface refers to 'pixels', which can be freed by the GC. Thus,
-    -- duplicate the surface to create a copy of the data owned by cairo.
-    local res = gsurface.duplicate_surface(surf)
-    surf:finish()
-    return res
+    return skia.Surface.from_bgra(pixels, w, h, stride)
 end
 
 local notif_methods = {}

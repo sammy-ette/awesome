@@ -16,8 +16,7 @@ local beautiful = require("beautiful")
 local lgi = require("lgi")
 local gtable = require("gears.table")
 local Pango = lgi.Pango
-local PangoCairo = rawget(_G, "skia") and nil or lgi.PangoCairo
-local PangoFT2 = rawget(_G, "skia") and lgi.PangoFT2 or nil
+local PangoFT2 = lgi.PangoFT2
 local setmetatable = setmetatable
 
 local textbox = { mt = {} }
@@ -27,7 +26,7 @@ local function new_pango_context()
         local font_map = PangoFT2.FontMap.new()
         return font_map, font_map:create_context()
     end
-    return nil, PangoCairo.font_map_get_default():create_context()
+    error("PangoFT2 is required by the Skia text renderer")
 end
 
 --- Set the DPI of a Pango layout
@@ -64,12 +63,11 @@ function textbox:draw(context, cr, width, height)
     elseif self._private.valign == "bottom" then
         offset = height - logical.height
     end
-    if cr.show_text then
-        -- The Skia canvas renders text directly. Pango remains responsible for
-        -- markup parsing, wrapping, ellipsizing, and measurement until its
-        -- shaping output is moved into the Skia text bridge.
-        cr:show_text(self._private.layout.text, 0, offset + logical.height,
-            "sans", logical.height)
+    if cr.show_layout then
+        -- Pango shapes the layout (markup, wrapping, ellipsizing, bidi) and
+        -- Skia draws the glyphs it produced, so the drawn text matches the
+        -- metrics that `fit` measured.
+        cr:show_layout(self._private.layout._native, 0, offset)
     else
         cr:update_layout(self._private.layout)
         cr:move_to(0, offset)

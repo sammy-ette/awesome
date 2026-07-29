@@ -15,8 +15,7 @@ local dofile = dofile
 local setmetatable = setmetatable
 local lgi = require("lgi")
 local Pango = lgi.Pango
-local PangoCairo = rawget(_G, "skia") and nil or lgi.PangoCairo
-local PangoFT2 = rawget(_G, "skia") and lgi.PangoFT2 or nil
+local PangoFT2 = lgi.PangoFT2
 local gears_debug = require("gears.debug")
 local Gio = require("lgi").Gio
 local protected_call = require("gears.protected_call")
@@ -43,7 +42,7 @@ local function new_font_context()
         local font_map = PangoFT2.FontMap.new()
         return font_map, font_map:create_context()
     end
-    return nil, PangoCairo.font_map_get_default():create_context()
+    error("PangoFT2 is required by the Skia text renderer")
 end
 
 

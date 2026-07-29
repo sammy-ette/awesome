@@ -26,9 +26,7 @@
 #include "common/luaclass.h"
 #include "draw.h"
 
-#ifdef WITH_SKIA_VULKAN
 #include "render/skia/skia_backend.h"
-#endif
 
 typedef void drawable_refresh_callback(void *);
 
@@ -38,14 +36,10 @@ struct drawable_t
     LUA_OBJECT_HEADER
     /** The pixmap we are drawing to. */
     xcb_pixmap_t pixmap;
-    /** Surface for drawing. */
-    cairo_surface_t *surface;
-#ifdef WITH_SKIA_VULKAN
     /** Vulkan/Skia presenter for an X11 window, if this drawable owns one. */
     awesome_skia_renderer_t *skia_renderer;
     /** The X11 window to which the renderer presents directly. */
     xcb_window_t presentation_window;
-#endif
     /** The geometry of the drawable (in root window coordinates). */
     area_t geometry;
     /** Surface contents are undefined if this is false. */
@@ -57,11 +51,8 @@ struct drawable_t
 };
 typedef struct drawable_t drawable_t;
 
-drawable_t *drawable_allocator(lua_State *, drawable_refresh_callback *, void *
-#ifdef WITH_SKIA_VULKAN
-                               , xcb_window_t
-#endif
-                               );
+drawable_t *drawable_allocator(lua_State *, drawable_refresh_callback *, void *,
+                               xcb_window_t);
 void drawable_set_geometry(lua_State *, int, area_t);
 void drawable_class_setup(lua_State *);
 

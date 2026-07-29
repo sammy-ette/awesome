@@ -21,7 +21,7 @@ local dpi = require("beautiful").xresources.apply_dpi
 local object = require("gears.object")
 local surface = require("gears.surface")
 local protected_call = require("gears.protected_call")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local setmetatable = setmetatable
 local tonumber = tonumber
 local string = string
@@ -626,8 +626,8 @@ function menu.entry(parent, args) -- luacheck: no unused args
                 w, h = (args.theme.height / ih) * iw, args.theme.height
             end
             -- We need to scale the image to size w x h
-            local img = cairo.ImageSurface(cairo.Format.ARGB32, w, h)
-            local cr = cairo.Context(img)
+            local img = skia.ImageSurface(skia.Format.ARGB32, w, h)
+            local cr = skia.Context(img)
             cr:scale(w / iw, h / ih)
             cr:set_source_surface(icon, 0, 0)
             cr:paint()

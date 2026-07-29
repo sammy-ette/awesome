@@ -31,8 +31,7 @@ include(awesomeConfig.cmake)
 # {{{ Skia/Vulkan GPU renderer
 # The renderer has a C ABI so Awesome's C core and Lua runtime can present
 # directly through Skia without importing Skia's C++ headers.
-if(WITH_SKIA_VULKAN)
-    enable_language(CXX)
+enable_language(CXX)
 
     find_package(Vulkan QUIET)
     if(Vulkan_FOUND)
@@ -50,6 +49,10 @@ if(WITH_SKIA_VULKAN)
     # configuration in tools/bootstrap-skia-vulkan-probe.sh. Keep this list in
     # CMake instead of requiring callers to reverse-engineer linker errors via
     # SKIA_EXTRA_LIBRARIES.
+    # Pango shapes the text (markup, wrapping, bidi); Skia draws the glyphs it
+    # produces, so the renderer needs Pango's FreeType/fontconfig backend.
+    pkg_check_modules(SKIA_PANGO REQUIRED pango pangoft2 fontconfig)
+
     pkg_check_modules(SKIA_SYSTEM REQUIRED
         fontconfig
         freetype2
@@ -72,11 +75,41 @@ if(WITH_SKIA_VULKAN)
 
     if(NOT EXISTS "${SKIA_SOURCE_DIR}/include/core/SkCanvas.h")
         message(FATAL_ERROR
-            "WITH_SKIA_VULKAN requires SKIA_SOURCE_DIR to point at a Skia checkout")
+            "Awesome requires SKIA_SOURCE_DIR to point at a Skia checkout")
     endif()
     if(NOT EXISTS "${SKIA_LIBRARY}")
         message(FATAL_ERROR
-            "WITH_SKIA_VULKAN requires SKIA_LIBRARY to point at libskia.a")
+            "Awesome requires SKIA_LIBRARY to point at libskia.a")
+    endif()
+
+    # Skia's SVG module (used to render SVG icons/images natively, replacing
+    # RSVG-over-Cairo) builds as separate static libraries alongside
+    # libskia.a. Link them when present; SVG loading just errors clearly at
+    # runtime otherwise, rather than failing the whole build.
+    get_filename_component(SKIA_LIB_DIR "${SKIA_LIBRARY}" DIRECTORY)
+    # Order matters for single-pass linkers: each entry may reference symbols
+    # from the ones after it (svg -> skshaper/skresources -> skunicode_icu ->
+    # skunicode_core), so list dependents before their dependencies.
+    set(SKIA_SVG_CANDIDATE_LIBS
+        libsvg.a libskshaper.a libskresources.a libskunicode_icu.a libskunicode_core.a)
+    set(SKIA_SVG_LIBRARIES "")
+    set(AWESOME_SKIA_HAS_SVG TRUE)
+    foreach(svg_lib ${SKIA_SVG_CANDIDATE_LIBS})
+        if(EXISTS "${SKIA_LIB_DIR}/${svg_lib}")
+            list(APPEND SKIA_SVG_LIBRARIES "${SKIA_LIB_DIR}/${svg_lib}")
+        else()
+            set(AWESOME_SKIA_HAS_SVG FALSE)
+        endif()
+    endforeach()
+    if(AWESOME_SKIA_HAS_SVG)
+        # libskunicode_icu.a needs the system ICU it was built against.
+        pkg_check_modules(SKIA_ICU icu-uc icu-i18n)
+        if(SKIA_ICU_FOUND)
+            list(APPEND SKIA_SVG_LIBRARIES ${SKIA_ICU_LDFLAGS})
+        else()
+            set(AWESOME_SKIA_HAS_SVG FALSE)
+            set(SKIA_SVG_LIBRARIES "")
+        endif()
     endif()
 
     add_library(awesome-skia-renderer STATIC
@@ -88,14 +121,23 @@ if(WITH_SKIA_VULKAN)
             ${SKIA_SOURCE_DIR}
             ${AWESOME_VULKAN_INCLUDE_DIRS}
             ${AWESOME_REQUIRED_INCLUDE_DIRS}
-            ${SKIA_SYSTEM_INCLUDE_DIRS})
+            ${SKIA_SYSTEM_INCLUDE_DIRS}
+            ${SKIA_PANGO_INCLUDE_DIRS})
     target_compile_definitions(awesome-skia-renderer
         PRIVATE VK_USE_PLATFORM_XCB_KHR)
+    if(AWESOME_SKIA_HAS_SVG)
+        target_compile_definitions(awesome-skia-renderer PRIVATE AWESOME_SKIA_HAS_SVG)
+    else()
+        message(STATUS "Skia SVG module libraries not found next to SKIA_LIBRARY; "
+            "SVG loading will be unavailable at runtime")
+    endif()
     target_compile_options(awesome-skia-renderer
         PRIVATE -std=c++20 -Wall -Wextra -Wpedantic)
     target_link_libraries(awesome-skia-renderer
         PUBLIC
+            ${SKIA_SVG_LIBRARIES}
             ${SKIA_LIBRARY}
+            ${SKIA_PANGO_LDFLAGS}
             ${AWESOME_VULKAN_LIBRARIES}
             ${AWESOME_COMMON_REQUIRED_LDFLAGS}
             ${SKIA_SYSTEM_LDFLAGS}
@@ -111,7 +153,6 @@ if(WITH_SKIA_VULKAN)
     # The entry point is C, but the linked renderer and Skia library require the
     # C++ runtime and must be linked by the C++ compiler driver.
     set_target_properties(skia-vulkan-probe PROPERTIES LINKER_LANGUAGE CXX)
-endif()
 # }}}
 
 include_directories(
@@ -238,13 +279,10 @@ target_link_libraries(${PROJECT_AWE_NAME}
     ${AWESOME_REQUIRED_LDFLAGS}
     ${AWESOME_OPTIONAL_LDFLAGS})
 
-if(WITH_SKIA_VULKAN)
-    target_compile_definitions(${PROJECT_AWE_NAME} PRIVATE WITH_SKIA_VULKAN)
-    target_link_libraries(${PROJECT_AWE_NAME} awesome-skia-renderer)
-    # The core remains C, but the renderer and static Skia archive require the
-    # C++ runtime at final link time.
-    set_target_properties(${PROJECT_AWE_NAME} PROPERTIES LINKER_LANGUAGE CXX)
-endif()
+target_link_libraries(${PROJECT_AWE_NAME} awesome-skia-renderer)
+# The core remains C, but the renderer and static Skia archive require the
+# C++ runtime at final link time.
+set_target_properties(${PROJECT_AWE_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
 # {{{ Generated sources
 # atoms
@@ -485,15 +523,9 @@ install(DIRECTORY ${SOURCE_DIR}/themes DESTINATION ${AWESOME_DATA_PATH}
 install(DIRECTORY ${BUILD_DIR}/themes DESTINATION ${AWESOME_DATA_PATH}
     PATTERN "*.lua")
 install(FILES ${AWE_DOC_FILES}  DESTINATION ${AWESOME_DOC_PATH})
-if(WITH_SKIA_VULKAN)
-    # A distinct name/absolute Exec path so this doesn't collide with (or get
-    # confused for) a normal Cairo build's session entry, especially since
-    # both commonly end up installed into the same system xsessions dir.
-    configure_file(${SOURCE_DIR}/awesome-skia.desktop.in ${BUILD_DIR}/awesome-skia.desktop @ONLY)
-    install(FILES ${BUILD_DIR}/awesome-skia.desktop DESTINATION ${AWESOME_XSESSION_PATH})
-else()
-    install(FILES "awesome.desktop" DESTINATION ${AWESOME_XSESSION_PATH})
-endif()
+# A distinct session entry while the Skia migration is developed.
+configure_file(${SOURCE_DIR}/awesome-skia.desktop.in ${BUILD_DIR}/awesome-skia.desktop @ONLY)
+install(FILES ${BUILD_DIR}/awesome-skia.desktop DESTINATION ${AWESOME_XSESSION_PATH})
 if(GENERATE_DOC)
     install(DIRECTORY ${BUILD_DIR}/doc DESTINATION ${AWESOME_DOC_PATH})
 endif()

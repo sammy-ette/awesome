@@ -35,7 +35,7 @@ local wibox     = require("wibox")
 local gfs       = require("gears.filesystem")
 local timer     = require("gears.timer")
 local gmath     = require("gears.math")
-local cairo     = require("lgi").cairo
+local skia      = require("skia")
 local util      = require("awful.util")
 
 local function get_screen(s)
@@ -518,11 +518,11 @@ function naughty.default_notification_handler(notification, args)
                     size_info.icon_h = icn:get_height() * size_info.icon_scale_factor
 
                     local scaled =
-                        cairo.ImageSurface(cairo.Format.ARGB32,
+                        skia.ImageSurface(skia.Format.ARGB32,
                             gmath.round(size_info.icon_w),
                             gmath.round(size_info.icon_h))
 
-                    local cr = cairo.Context(scaled)
+                    local cr = skia.Context(scaled)
                     cr:scale(size_info.icon_scale_factor, size_info.icon_scale_factor)
                     cr:set_source_surface(icn, 0, 0)
                     cr:paint()

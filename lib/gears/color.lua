@@ -47,10 +47,7 @@ local ipairs = ipairs
 local pairs = pairs
 local type = type
 local lgi = require("lgi")
-local skia = rawget(_G, "skia")
--- The Skia module stands in for the parts of the cairo namespace this module
--- uses (Pattern in particular); anything Skia lacks needs an explicit branch.
-local cairo = skia or lgi.cairo
+local skia = require("skia")
 local Pango = lgi.Pango
 local surface = require("gears.surface")
 
@@ -137,7 +134,7 @@ function color.create_solid_pattern(col)
     elseif type(col) == "table" then
         col = col.color
     end
-    return cairo.Pattern.create_rgba(color.parse_color(col))
+    return skia.Pattern.create_rgba(color.parse_color(col))
 end
 
 --- Create an image pattern from a png file
@@ -150,8 +147,8 @@ function color.create_png_pattern(file)
         file = file.file
     end
     local image = surface.load(file)
-    local pattern = cairo.Pattern.create_for_surface(image)
-    pattern:set_extend(cairo.Extend.REPEAT)
+    local pattern = skia.Pattern.create_for_surface(image)
+    pattern:set_extend(skia.Extend.REPEAT)
     return pattern
 end
 
@@ -206,12 +203,12 @@ function color.create_linear_pattern(arg)
     local pat
 
     if type(arg) == "string" then
-        return string_pattern(cairo.Pattern.create_linear, arg)
+        return string_pattern(skia.Pattern.create_linear, arg)
     elseif type(arg) ~= "table" then
         error("Wrong argument type: " .. type(arg))
     end
 
-    pat = cairo.Pattern.create_linear(arg.from[1], arg.from[2], arg.to[1], arg.to[2])
+    pat = skia.Pattern.create_linear(arg.from[1], arg.from[2], arg.to[1], arg.to[2])
     add_stops_table(pat, arg.stops)
     return pat
 end
@@ -232,12 +229,12 @@ function color.create_radial_pattern(arg)
     local pat
 
     if type(arg) == "string" then
-        return string_pattern(cairo.Pattern.create_radial, arg)
+        return string_pattern(skia.Pattern.create_radial, arg)
     elseif type(arg) ~= "table" then
         error("Wrong argument type: " .. type(arg))
     end
 
-    pat = cairo.Pattern.create_radial(arg.from[1], arg.from[2], arg.from[3],
+    pat = skia.Pattern.create_radial(arg.from[1], arg.from[2], arg.from[3],
             arg.to[1], arg.to[2], arg.to[3])
     add_stops_table(pat, arg.stops)
     return pat
@@ -263,7 +260,7 @@ color.types = {
 -- @staticfct gears.color.create_pattern_uncached
 function color.create_pattern_uncached(col)
     -- If it already is a cairo pattern, just leave it as that
-    if cairo.Pattern:is_type_of(col) then
+    if skia.Pattern:is_type_of(col) then
         return col
     end
     col = col or "#000000"
@@ -288,7 +285,7 @@ end
 -- @treturn gears.color A cairo pattern object.
 -- @staticfct gears.color.create_pattern
 function color.create_pattern(col)
-    if cairo.Pattern:is_type_of(col) then
+    if skia.Pattern:is_type_of(col) then
         return col
     end
     return pattern_cache:get(col or "#000000")
@@ -352,23 +349,12 @@ end
 -- @return Recolored image.
 -- @staticfct gears.color.recolor_image
 function color.recolor_image(image, new_color)
-    if skia then
-        -- Keep the source's alpha but replace its colour. Skia images are
-        -- immutable, so this composites into a fresh surface with SrcIn
-        -- rather than masking the image in place the way Cairo does.
-        image = surface.load(image)
-        local w, h = image:get_width(), image:get_height()
-        local canvas = skia.new_image_surface(math.max(w, 1), math.max(h, 1))
-        canvas:draw_image(image, 0, 0)
-        canvas:set_source(color.create_pattern(new_color))
-        canvas.operator = "IN"
-        canvas:paint()
-        return canvas:snapshot()
-    end
+    -- Keep the source's alpha, replace its colour.
     image = surface.duplicate_surface(image)
-    local cr = cairo.Context.create(image)
+    local cr = skia.Context(image)
     cr:set_source(color.create_pattern(new_color))
-    cr:mask(cairo.Pattern.create_for_surface(image), 0, 0)
+    cr:set_operator(skia.Operator.IN)
+    cr:paint()
     return image
 end
 
@@ -385,7 +371,7 @@ function color.change_opacity(input, opacity)
 
     if error ~= "SUCCESS" then return input end
 
-    return cairo.Pattern.create_rgba(r, g, b, opacity)
+    return skia.Pattern.create_rgba(r, g, b, opacity)
 end
 
 --- Convert a color back to an hexadecimal color code.

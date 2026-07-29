@@ -64,19 +64,10 @@ end
 -- native surfaces and LGI-ified Cairo surfaces.
 function root.wallpaper(pattern)
     if not pattern then return root._wallpaper() end
-
-    -- Checking for type will either potentially `error()` or always
-    -- return `userdata`. This check will error() when the surface is
-    -- already native.
-    local err = pcall(function() return pattern._native end)
-
-    -- The presence of `root._write_string` means the test backend is
-    -- used. Avoid passing the native surface.
-    if err and not root._write_string then
-        return root._wallpaper(pattern._native)
-    else
+    if root._write_string then
         return root._wallpaper(pattern)
     end
+    return require("gears.wallpaper").set(pattern)
 end
 
 

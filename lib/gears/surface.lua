@@ -1,5 +1,5 @@
 ---------------------------------------------------------------------------
--- Utilities to integrate and manipulate Cairo drawing surfaces.
+-- Utilities to integrate and manipulate Skia drawing surfaces.
 --
 -- @author Uli Schlachter
 -- @copyright 2012 Uli Schlachter
@@ -9,8 +9,7 @@
 local setmetatable = setmetatable
 local type = type
 local capi = { awesome = awesome }
-local skia = rawget(_G, "skia")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local GdkPixbuf = require("lgi").GdkPixbuf
 local color, beautiful = nil, nil
 local gdebug = require("gears.debug")
@@ -28,17 +27,14 @@ local surface_cache = setmetatable({}, { __mode = 'v' })
 
 local function get_default(arg)
     if type(arg) == 'nil' then
-        if skia then
-            -- Smallest valid stand-in: callers only ever measure or draw it,
-            -- and a zero-sized image cannot be created.
-            return skia.new_image_surface(1, 1):snapshot()
-        end
-        return cairo.ImageSurface(cairo.Format.ARGB32, 0, 0)
+        -- Smallest valid stand-in: callers only measure or draw it, and a
+        -- zero-sized surface cannot be created.
+        return skia.ImageSurface(skia.Format.ARGB32, 1, 1)
     end
     return arg
 end
 
---- Try to convert the argument into an lgi cairo surface.
+--- Try to convert the argument into a Skia surface.
 -- This is usually needed for loading images by file name.
 -- @param surface The surface to load or nil
 -- @param default The default value to return on error; when nil, then a surface
@@ -51,45 +47,31 @@ function surface.load_uncached_silently(_surface, default)
     if not _surface then
         return get_default(default)
     end
-    if skia then
-        -- Under Skia an "image surface" is a skia.image: already-decoded ones
-        -- pass straight through, and file names are decoded by Skia itself.
-        if skia.is_image(_surface) then
-            return _surface
-        end
-        if type(_surface) == "string" then
-            local image, err = skia.load_image(_surface)
-            if not image then
-                return get_default(default), err
-            end
-            return image
-        end
-        return get_default(default),
-            "cannot convert a " .. type(_surface) .. " into a Skia image"
-    end
-    -- lgi cairo surfaces don't get changed either
-    if cairo.Surface:is_type_of(_surface) then
+    -- Surfaces pass straight through
+    if skia.Surface.is_type_of(_surface) or skia.is_image(_surface) then
         return _surface
     end
     -- Strings are assumed to be file names and get loaded
     if type(_surface) == "string" then
-        local pixbuf, err = GdkPixbuf.Pixbuf.new_from_file(_surface)
-        if not pixbuf then
-            return get_default(default), tostring(err)
+        if _surface:lower():match("%.svg$") then
+            local width, height = skia.svg_dimensions(_surface)
+            if width and height then
+                local loaded, err = skia.load_svg(_surface, math.ceil(width), math.ceil(height))
+                if loaded then return loaded end
+                return get_default(default), err
+            end
         end
-        _surface = capi.awesome.pixbuf_to_surface(pixbuf._native, _surface)
-
-        -- The shims implement load_image() to return a surface directly,
-        -- instead of a lightuserdatum.
-        if cairo.Surface:is_type_of(_surface) then
-            return _surface
+        local loaded, err = skia.Surface.load(_surface)
+        if not loaded then
+            return get_default(default), err
         end
+        return loaded
     end
-    -- Everything else gets forced into a surface
-    return cairo.Surface(_surface, true)
+    return get_default(default),
+        "cannot convert a " .. type(_surface) .. " into a Skia surface"
 end
 
---- Try to convert the argument into an lgi cairo surface.
+--- Try to convert the argument into a Skia surface.
 -- This is usually needed for loading images by file name and uses a cache.
 -- In contrast to `load()`, errors are returned to the caller.
 -- @param surface The surface to load or nil
@@ -128,7 +110,7 @@ local function do_load_and_handle_errors(self, func)
     return get_default()
 end
 
---- Try to convert the argument into an lgi cairo surface.
+--- Try to convert the argument into a Skia surface.
 -- This is usually needed for loading images by file name. Errors are handled
 -- via `gears.debug.print_error`.
 -- @param surface The surface to load or nil
@@ -138,7 +120,7 @@ function surface.load_uncached(self)
     return do_load_and_handle_errors(self, surface.load_uncached_silently)
 end
 
---- Try to convert the argument into an lgi cairo surface.
+--- Try to convert the argument into a Skia surface.
 -- This is usually needed for loading images by file name. Errors are handled
 -- via `gears.debug.print_error`.
 -- @param surface The surface to load or nil
@@ -152,21 +134,16 @@ function surface.mt.__call(_, ...)
     return surface.load(...)
 end
 
---- Get the size of a cairo surface
+--- Get the size of a Skia surface
 -- @param surf The surface you are interested in
 -- @return The surface's width and height.
 -- @staticfct get_size
 function surface.get_size(surf)
-    if skia then
-        surf = surface.load(surf)
-        return surf:get_width(), surf:get_height()
-    end
-    local cr = cairo.Context(surf)
-    local x, y, w, h = cr:clip_extents()
-    return w - x, h - y
+    surf = surface.load(surf)
+    return surf:get_width(), surf:get_height()
 end
 
---- Create a copy of a cairo surface.
+--- Create a copy of a Skia surface.
 -- The surfaces returned by `surface.load` are cached and must not be
 -- modified to avoid unintended side-effects. This function allows to create
 -- a copy of a cairo surface. This copy can then be freely modified.
@@ -180,24 +157,11 @@ end
 function surface.duplicate_surface(s)
     s = surface.load(s)
 
-    if skia then
-        -- Skia images are immutable, so a "copy" is a fresh offscreen surface
-        -- with the source drawn into it, which the caller may then paint over.
-        local w, h = s:get_width(), s:get_height()
-        local copy = skia.new_image_surface(math.max(w, 1), math.max(h, 1))
-        copy:draw_image(s, 0, 0)
-        return copy:snapshot()
-    end
-
-    -- Figure out surface size (this does NOT work for unbounded recording surfaces)
-    local cr = cairo.Context(s)
-    local x, y, w, h = cr:clip_extents()
-
-    -- Create a copy
-    local result = s:create_similar(s.content, w - x, h - y)
-    cr = cairo.Context(result)
+    local w, h = s:get_width(), s:get_height()
+    local result = skia.ImageSurface(skia.Format.ARGB32, math.max(w, 1), math.max(h, 1))
+    local cr = skia.Context(result)
     cr:set_source_surface(s, 0, 0)
-    cr.operator = cairo.Operator.SOURCE
+    cr:set_operator(skia.Operator.SOURCE)
     cr:paint()
     return result
 end
@@ -209,13 +173,13 @@ end
 -- @param shape A `gears.shape` compatible function
 -- @param[opt="#000000"] shape_color The shape color or pattern
 -- @param[opt="#00000000"] bg_color The surface background color
--- @treturn cairo.surface the new surface
+-- @treturn skia.Surface the new surface
 -- @staticfct load_from_shape
 function surface.load_from_shape(width, height, shape, shape_color, bg_color, ...)
     color = color or require("gears.color")
 
-    local img = cairo.ImageSurface(cairo.Format.ARGB32, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(skia.Format.ARGB32, width, height)
+    local cr = skia.Context(img)
 
     cr:set_source(color(bg_color or "#00000000"))
     cr:paint()
@@ -241,20 +205,20 @@ end
 function surface.apply_shape_bounding(draw, shape, ...)
   local geo = draw:geometry()
 
-  local img = cairo.ImageSurface(cairo.Format.A1, geo.width, geo.height)
-  local cr = cairo.Context(img)
+  local img = skia.ImageSurface(skia.Format.A1, geo.width, geo.height)
+  local cr = skia.Context(img)
 
-  cr:set_operator(cairo.Operator.CLEAR)
+  cr:set_operator(skia.Operator.CLEAR)
   cr:set_source_rgba(0,0,0,1)
   cr:paint()
-  cr:set_operator(cairo.Operator.SOURCE)
+  cr:set_operator(skia.Operator.SOURCE)
   cr:set_source_rgba(1,1,1,1)
 
   shape(cr, geo.width, geo.height, ...)
 
   cr:fill()
 
-  draw.shape_bounding = img._native
+  draw.shape_bounding = img
   img:finish()
 end
 
@@ -282,8 +246,8 @@ end
 function surface.widget_to_svg(widget, path, width, height)
     gdebug.deprecate("Use wibox.widget.draw_to_svg_file instead of "..
         "gears.surface.widget_to_svg", {deprecated_in=5})
-    local img = cairo.SvgSurface.create(path, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.SvgSurface.create(path, width, height)
+    local cr = skia.Context(img)
 
     -- Bad dependecy, but this is deprecated.
     beautiful = beautiful or require("beautiful")
@@ -308,8 +272,8 @@ end
 function surface.widget_to_surface(widget, width, height, format)
     gdebug.deprecate("Use wibox.widget.draw_to_image_surface instead of "..
         "gears.surface.render_to_surface", {deprecated_in=5})
-    local img = cairo.ImageSurface(format or cairo.Format.ARGB32, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(format or skia.Format.ARGB32, width, height)
+    local cr = skia.Context(img)
 
     -- Bad dependecy, but this is deprecated.
     color = color or require("gears.color")
@@ -386,10 +350,10 @@ function surface.crop_surface(args)
         end
     end
 
-    local ret = cairo.ImageSurface(cairo.Format.ARGB32, w, h)
-    local cr = cairo.Context(ret)
+    local ret = skia.ImageSurface(skia.Format.ARGB32, math.max(w, 1), math.max(h, 1))
+    local cr = skia.Context(ret)
     cr:set_source_surface(surf, offset_w, offset_h)
-    cr.operator = cairo.Operator.SOURCE
+    cr:set_operator(skia.Operator.SOURCE)
     cr:paint()
 
     return ret

@@ -35,7 +35,7 @@ local capi = {
 local gears     = require("gears")
 local beautiful = require("beautiful")
 local wibox     = require("wibox")
-local cairo     = require("lgi").cairo
+local skia      = require("skia")
 local abutton   = require("awful.button")
 local akey      = require("awful.key")
 local akgrabber = require("awful.keygrabber")
@@ -67,8 +67,8 @@ end
 
 -- Convert to a real image surface so it can be added to an imagebox.
 local function to_surface(raw_surface, width, height)
-    local img = cairo.ImageSurface(cairo.Format.RGB24, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(skia.Format.RGB24, width, height)
+    local cr = skia.Context(img)
     cr:set_source_surface(gears.surface(raw_surface))
     cr:paint()
 
@@ -167,9 +167,9 @@ end
 -- run by the mousegrabber and the programmatically defined snip function,
 -- though there may be other uses.
 local function crop_shot(source, geo)
-    local target = source:create_similar(cairo.Content.COLOR, geo.width, geo.height)
+    local target = skia.ImageSurface(skia.Format.RGB24, geo.width, geo.height)
 
-    local cr = cairo.Context(target)
+    local cr = skia.Context(target)
     cr:set_source_surface(source, -geo.x, -geo.y)
     cr:rectangle(0, 0, geo.width, geo.height)
     cr:fill()

@@ -34,7 +34,7 @@ local gmath = require("gears.math")
 local gcolor = require("gears.color")
 local gdebug = require("gears.debug")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 
 local grid = { mt = {} }
 
@@ -1393,13 +1393,9 @@ local function create_border_mask(self, areas, default_color)
 
     -- A1 is fine because :layout() aligns to pixel boundary and `border_width`
     -- are integers.
-    local img = cairo.RecordingSurface(cairo.Content.COLOR_ALPHA, cairo.Rectangle {
-        x      = 0,
-        y      = 0,
-        width  = areas.end_x + right,
-        height = areas.end_y + bottom
-    })
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(
+        skia.Format.ARGB32, areas.end_x + right, areas.end_y + bottom)
+    local cr = skia.Context(img)
     cr:set_source(default_color)
 
     local bw_i, bw_o = self._private.border_width.inner, self._private.border_width.outer
@@ -1453,7 +1449,7 @@ local function create_border_mask(self, areas, default_color)
             end
 
             if args.caps then
-                cr:set_line_cap(cairo.LineCap[args.caps:upper()])
+                cr:set_line_cap(skia.LineCap[args.caps:upper()])
             end
 
             cr:set_source(args.color)
@@ -1477,7 +1473,7 @@ local function create_border_mask(self, areas, default_color)
 
     -- Remove the area used by widgets. This needs to be done regardless of the
     -- border mode to handle row/col span.
-    cr:set_operator(cairo.Operator.CLEAR)
+    cr:set_operator(skia.Operator.CLEAR)
 
     for _, area in ipairs(areas) do
         cr:rectangle(area.x, area.y, area.width, area.height)

@@ -43,7 +43,6 @@
 
 #include "math.h"
 
-#include <cairo-xcb.h>
 #include <xcb/shape.h>
 #include <xcb/composite.h>
 #include <xcb/xcb_aux.h>
@@ -207,7 +206,6 @@ static void
 drawin_update_drawing(lua_State *L, int widx)
 {
     drawin_t *w = luaA_checkudata(L, widx, &drawin_class);
-#ifdef WITH_SKIA_VULKAN
     /* A Vulkan swapchain is sized from the X window's *actual* geometry, not
      * from the size we ask for. Drawins are created 1x1 and resized later, so
      * the pending configure has to reach the server before the drawable is
@@ -215,7 +213,6 @@ drawin_update_drawing(lua_State *L, int widx)
      * as a sliver. */
     drawin_apply_moveresize(w);
     xcb_aux_sync(globalconf.connection);
-#endif
     luaA_object_push_item(L, widx, w->drawable);
     drawable_set_geometry(L, -1, w->geometry);
     lua_pop(L, 1);
@@ -338,9 +335,6 @@ drawin_refresh_pixmap_partial(drawin_t *drawin,
     /* Make sure it really has the size it should have */
     drawin_apply_moveresize(drawin);
 
-    /* Make cairo do all pending drawing (no-op without a Cairo surface) */
-    if (drawin->drawable->surface)
-        cairo_surface_flush(drawin->drawable->surface);
     xcb_copy_area(globalconf.connection, drawin->drawable->pixmap,
                   drawin->window, globalconf.gc, x, y, x, y,
                   w, h);
@@ -362,8 +356,8 @@ drawin_map(lua_State *L, int widx)
     stack_windows();
     /* Add it to the list of visible drawins */
     drawin_array_append(&globalconf.drawins, drawin);
-    /* Make sure it has a surface */
-    if(drawin->drawable->surface == NULL)
+    /* Make sure its Skia swapchain has been created. */
+    if(drawin->drawable->skia_renderer == NULL)
         drawin_update_drawing(L, widx);
 }
 
@@ -471,11 +465,8 @@ drawin_allocator(lua_State *L)
                           globalconf.default_cmap,
                           xcursor_new(&globalconf.cursor_cache, globalconf.cursor_ctx, w->cursor)
                       });
-    drawable_allocator(L, (drawable_refresh_callback *) drawin_refresh_pixmap, w
-#ifdef WITH_SKIA_VULKAN
-                       , w->window
-#endif
-                       );
+    drawable_allocator(L, (drawable_refresh_callback *) drawin_refresh_pixmap, w,
+                       w->window);
     w->drawable = luaA_object_ref_item(L, -2, -1);
     if (globalconf.is_compositing)
         xcb_composite_redirect_subwindows(globalconf.connection, w->window, XCB_COMPOSITE_REDIRECT_MANUAL);
@@ -739,11 +730,11 @@ luaA_drawin_set_input_passthrough(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_get_shape_bounding(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_BOUNDING);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_BOUNDING);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -755,17 +746,13 @@ luaA_drawin_get_shape_bounding(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_set_shape_bounding(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-
     /* The drawin might have been resized to a larger size. Apply that. */
     drawin_apply_moveresize(drawin);
 
-    xwindow_set_shape(drawin->window,
+    xwindow_set_shape(L, -1, drawin->window,
             drawin->geometry.width + 2*drawin->border_width,
             drawin->geometry.height + 2*drawin->border_width,
-            XCB_SHAPE_SK_BOUNDING, surf, -drawin->border_width);
+            XCB_SHAPE_SK_BOUNDING, -drawin->border_width);
     luaA_object_emit_signal(L, -3, "property::shape_bounding", 0);
     return 0;
 }
@@ -778,11 +765,11 @@ luaA_drawin_set_shape_bounding(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_get_shape_clip(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_CLIP);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_CLIP);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -794,15 +781,11 @@ luaA_drawin_get_shape_clip(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_set_shape_clip(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-
     /* The drawin might have been resized to a larger size. Apply that. */
     drawin_apply_moveresize(drawin);
 
-    xwindow_set_shape(drawin->window, drawin->geometry.width, drawin->geometry.height,
-            XCB_SHAPE_SK_CLIP, surf, 0);
+    xwindow_set_shape(L, -1, drawin->window, drawin->geometry.width, drawin->geometry.height,
+            XCB_SHAPE_SK_CLIP, 0);
     luaA_object_emit_signal(L, -3, "property::shape_clip", 0);
     return 0;
 }
@@ -815,11 +798,11 @@ luaA_drawin_set_shape_clip(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_get_shape_input(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_INPUT);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(drawin->window, XCB_SHAPE_SK_INPUT);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -831,17 +814,13 @@ luaA_drawin_get_shape_input(lua_State *L, drawin_t *drawin)
 static int
 luaA_drawin_set_shape_input(lua_State *L, drawin_t *drawin)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-
     /* The drawin might have been resized to a larger size. Apply that. */
     drawin_apply_moveresize(drawin);
 
-    xwindow_set_shape(drawin->window,
+    xwindow_set_shape(L, -1, drawin->window,
             drawin->geometry.width + 2*drawin->border_width,
             drawin->geometry.height + 2*drawin->border_width,
-            XCB_SHAPE_SK_INPUT, surf, -drawin->border_width);
+            XCB_SHAPE_SK_INPUT, -drawin->border_width);
     luaA_object_emit_signal(L, -3, "property::shape_input", 0);
     return 0;
 }

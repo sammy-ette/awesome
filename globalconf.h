@@ -42,6 +42,7 @@
 #include "common/xembed.h"
 #include "common/xcursor.h"
 #include "common/buffer.h"
+#include "render/skia/skia_lua.h"
 
 #define ROOT_WINDOW_EVENT_MASK \
     (const uint32_t []) { \
@@ -228,7 +229,7 @@ typedef struct
     /** The preferred size of client icons for this screen */
     uint32_t preferred_icon_size;
     /** Cached wallpaper information */
-    cairo_surface_t *wallpaper;
+    awesome_skia_image_t *wallpaper;
     /** List of enter/leave events to ignore */
     sequence_pair_array_t ignore_enter_leave_events;
     xcb_void_cookie_t pending_enter_leave_begin;

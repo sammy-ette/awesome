@@ -132,14 +132,10 @@
 require("awful._compat")
 local gtable     = require( "gears.table"               )
 local gobject    = require( "gears.object"              )
-local gcolor     = require( "gears.color"               )
 local gtimer     = require( "gears.timer"               )
-local surface    = require( "gears.surface"             )
 local base       = require( "wibox.widget.base"         )
 local background = require( "wibox.container.background")
 local beautiful  = require( "beautiful"                 )
-local cairo      = require( "lgi" ).cairo
-local draw       = require( "wibox.widget" ).draw_to_cairo_context
 local grect      = require( "gears.geometry" ).rectangle
 
 local capi = { screen = screen, root = root }
@@ -157,9 +153,8 @@ local backgrounds = setmetatable({}, {__mode = 'k'})
 
 local panning_modes = {}
 
--- A root pixmap is a Cairo/X11 target. Skia wallpapers are desktop drawins;
--- their normal widget tree therefore renders through the same GPU canvas as a
--- wibar instead of being rasterized into a root pixmap first.
+-- Wallpapers are desktop drawins. Their widget trees render through the same
+-- Skia/Vulkan canvas as wibars instead of being rasterized into a root pixmap.
 local function paint_skia_wallpapers()
     local walls = {}
     for _, wall in pairs(backgrounds) do
@@ -298,143 +293,13 @@ end
 
 
 local function paint()
-    if rawget(_G, "skia") then
-        paint_skia_wallpapers()
-        return
-    end
-    if not next(pending_repaint) then return end
-
-    local root_width, root_height = capi.root.size()
-
-    -- Get the current wallpaper content.
-    local source = surface(root.wallpaper())
-
-    local target, cr
-
-    -- It's possible that a wallpaper for 1 screen is set using another tool, so make
-    -- sure we copy the current content.
-    if source then
-        target = source:create_similar(cairo.Content.COLOR, root_width, root_height)
-        cr     = cairo.Context(target)
-
-        -- Copy the old wallpaper to the new one
-        cr:save()
-        cr.operator = cairo.Operator.SOURCE
-        cr:set_source_surface(source, 0, 0)
-
-        for s in screen do
-            cr:rectangle(
-                s.geometry.x,
-                s.geometry.y,
-                s.geometry.width,
-                s.geometry.height
-            )
-        end
-
-        cr:clip()
-
-        cr:paint()
-        cr:restore()
-    else
-        target = cairo.ImageSurface(cairo.Format.RGB32, root_width, root_height)
-        cr     = cairo.Context(target)
-    end
-
-    local walls = {}
-
-    for _, wall in pairs(backgrounds) do
-        walls[wall] = true
-    end
-
-    -- Not supposed to happen, but there is enough API surface for
-    -- it to be a side effect of some signals. Calling the panning
-    -- mode callback with zero screen is not supported.
-    if not next(walls) then
-        return
-    end
-
-    for wall in pairs(walls) do
-
-        local geo = type(wall._private.panning_area) == "function" and
-            wall._private.panning_area(wall) or
-            panning_modes[wall._private.panning_area](wall)
-
-        -- If false, this panning area isn't well suited for the screen geometry.
-        if geo.width > 0 or geo.height > 0 then
-            local uncovered_areas = grect.area_remove(get_rectangles(wall.screens, false, false), geo)
-
-            cr:save()
-
-            -- Prevent overwrite then there is multiple non-continuous screens.
-            for _, s in ipairs(wall.screens) do
-                cr:rectangle(
-                    s.geometry.x,
-                    s.geometry.y,
-                    s.geometry.width,
-                    s.geometry.height
-                )
-            end
-
-            cr:clip()
-
-            -- The older surface might contain garbage, optionally clean it.
-            if wall.uncovered_areas_color then
-                cr:set_source(gcolor(wall.uncovered_areas_color))
-
-                for _, area in ipairs(uncovered_areas) do
-                    cr:rectangle(area.x, area.y, area.width, area.height)
-                    cr:fill()
-                end
-            end
-
-            if not wall._private.container then
-                wall._private.container = background()
-                wall._private.container.bg = wall._private.bg or beautiful.wallpaper_bg or "#000000"
-                wall._private.container.fg = wall._private.fg or beautiful.wallpaper_fg or "#ffffff"
-                wall._private.container.widget = wall.widget
-            end
-
-            local a_context = {
-                dpi = wall._private.context.dpi
-            }
-
-            -- Pick the lowest DPI.
-            if not a_context.dpi then
-                a_context.dpi = math.huge
-                for _, s in ipairs(wall.screens) do
-                    a_context.dpi = math.min(
-                        s.dpi and s.dpi or s.preferred_dpi, a_context.dpi
-                    )
-                end
-            end
-
-            -- Fallback.
-            if not a_context.dpi then
-                a_context.dpi = 96
-            end
-
-            cr:translate(geo.x, geo.y)
-            draw(wall._private.container, cr, geo.width, geo.height, a_context)
-            cr:restore()
-        end
-    end
-
-    -- Set the wallpaper.
-    local pattern = cairo.Pattern.create_for_surface(target)
-    capi.root.wallpaper(pattern)
-
-    -- Limit some potential GC induced increase in memory usage.
-    -- But really, is someone is trying to apply wallpaper changes more
-    -- often than the GC is executed, they are doing it wrong.
-    target:finish()
-
+    paint_skia_wallpapers()
 end
 
 local mutex = false
 
--- Uploading the surface to X11 is *very* resource intensive. Given the updates
--- will often happen in batch (like startup), make sure to only do one "real"
--- update.
+-- Recreating desktop drawins for every property update is unnecessary. Batch
+-- updates into a single repaint on the next main-loop turn.
 local function update()
     if mutex then return end
 

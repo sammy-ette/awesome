@@ -95,7 +95,6 @@ local grect = require("gears.geometry").rectangle
 local gdebug = require("gears.debug")
 local gmath = require("gears.math")
 local gtable = require("gears.table")
-local cairo = require( "lgi" ).cairo
 local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility with Lua 5.1)
 
 local function get_screen(s)
@@ -812,14 +811,15 @@ end
 -- Check if the proposed geometry fits the screen
 local function fit_in_bounding(obj, geo, args)
     local round_sgeo = round_geometry(get_parent_geometry(obj, args))
-    local region     = cairo.Region.create_rectangle(cairo.RectangleInt(round_sgeo))
-
     local round_geo = round_geometry(geo)
-    region:intersect(cairo.Region.create_rectangle(
-        cairo.RectangleInt(round_geo)
-    ))
-
-    local geo2 = region:get_rectangle(0)
+    local left = math.max(round_sgeo.x, round_geo.x)
+    local top = math.max(round_sgeo.y, round_geo.y)
+    local right = math.min(round_sgeo.x + round_sgeo.width, round_geo.x + round_geo.width)
+    local bottom = math.min(round_sgeo.y + round_sgeo.height, round_geo.y + round_geo.height)
+    local geo2 = {
+        width = math.max(0, right - left),
+        height = math.max(0, bottom - top),
+    }
 
     -- If the geometry is the same then it fits, otherwise it will be cropped.
     return geo2.width == round_geo.width and geo2.height == round_geo.height

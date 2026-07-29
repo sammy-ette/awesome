@@ -103,7 +103,6 @@
 
 #include <xcb/xcb_atom.h>
 #include <xcb/shape.h>
-#include <cairo-xcb.h>
 
 lua_class_t client_class;
 
@@ -1536,6 +1535,7 @@ typedef enum {
 
 static area_t titlebar_get_area(client_t *c, client_titlebar_t bar);
 static drawable_t *titlebar_get_drawable(lua_State *L, client_t *c, int cl_idx, client_titlebar_t bar);
+static void titlebar_configure_window(client_t *c, client_titlebar_t bar, area_t area);
 static void client_resize_do(client_t *c, area_t geometry);
 static void client_set_maximized_common(lua_State *L, int cidx, bool s, const char* type, const int val);
 
@@ -1548,7 +1548,7 @@ client_wipe(client_t *c)
 {
     key_array_wipe(&c->keys);
     xcb_icccm_get_wm_protocols_reply_wipe(&c->protocols);
-    cairo_surface_array_wipe(&c->icons);
+    awesome_skia_image_array_wipe(&c->icons);
     p_delete(&c->machine);
     p_delete(&c->class);
     p_delete(&c->instance);
@@ -1738,6 +1738,11 @@ client_getbyframewin(xcb_window_t w)
     foreach(c, globalconf.clients)
         if((*c)->frame_window == w)
             return *c;
+        else
+            for (client_titlebar_t bar = CLIENT_TITLEBAR_TOP;
+                 bar < CLIENT_TITLEBAR_COUNT; bar++)
+                if ((*c)->titlebar[bar].window == w)
+                    return *c;
 
     return NULL;
 }
@@ -2510,6 +2515,7 @@ client_resize_do(client_t *c, area_t geometry)
         luaA_object_push_item(L, -1, drawable);
 
         area_t area = titlebar_get_area(c, bar);
+        titlebar_configure_window(c, bar, area);
 
         /* Convert to global coordinates */
         area.x += geometry.x;
@@ -3001,7 +3007,7 @@ client_unmanage(client_t *c, client_unmanage_t reason)
     /* Get rid of all titlebars */
     for (client_titlebar_t bar = CLIENT_TITLEBAR_TOP; bar < CLIENT_TITLEBAR_COUNT; bar++) {
         if (c->titlebar[bar].drawable == NULL)
-            continue;
+            goto destroy_titlebar_window;
 
         if (globalconf.drawable_under_mouse == c->titlebar[bar].drawable) {
             /* Leave drawable before we invalidate the client */
@@ -3015,6 +3021,13 @@ client_unmanage(client_t *c, client_unmanage_t reason)
         luaA_object_unref_item(L, -1, c->titlebar[bar].drawable);
         c->titlebar[bar].drawable = NULL;
         lua_pop(L, 1);
+
+destroy_titlebar_window:
+        if (c->titlebar[bar].window != XCB_NONE)
+        {
+            xcb_destroy_window(globalconf.connection, c->titlebar[bar].window);
+            c->titlebar[bar].window = XCB_NONE;
+        }
     }
 
     /* Clear our event mask so that we don't receive any events from now on,
@@ -3155,9 +3168,9 @@ luaA_client_isvisible(lua_State *L)
  * \param array Array of icons to set.
  */
 void
-client_set_icons(client_t *c, cairo_surface_array_t array)
+client_set_icons(client_t *c, awesome_skia_image_array_t array)
 {
-    cairo_surface_array_wipe(&c->icons);
+    awesome_skia_image_array_wipe(&c->icons);
     c->icons = array;
 
     lua_State *L = globalconf_get_lua_State();
@@ -3173,78 +3186,154 @@ client_set_icons(client_t *c, cairo_surface_array_t array)
  * \param iidx The image index on the stack.
  */
 static void
-client_set_icon(client_t *c, cairo_surface_t *s)
+client_set_icon(client_t *c, awesome_skia_image_t *image)
 {
-    cairo_surface_array_t array;
-    cairo_surface_array_init(&array);
-    if (s && cairo_surface_status(s) == CAIRO_STATUS_SUCCESS)
-        cairo_surface_array_push(&array, draw_dup_image_surface(s));
+    awesome_skia_image_array_t array;
+    awesome_skia_image_array_init(&array);
+    if (image)
+        awesome_skia_image_array_push(&array, awesome_skia_image_ref(image));
     client_set_icons(c, array);
 }
 
 
-/** Set a client icon.
- * \param c The client to change.
- * \param icon A bitmap containing the icon.
- * \param mask A mask for the bitmap (optional)
- */
+static uint8_t
+client_unpack_visual_component(uint32_t pixel, uint32_t mask)
+{
+    unsigned int shift = 0;
+    uint32_t maximum;
+
+    if (!mask)
+        return 0;
+    while (!(mask & 1)) {
+        mask >>= 1;
+        shift++;
+    }
+    maximum = mask;
+    return ((pixel >> shift) & maximum) * 255u / maximum;
+}
+
+static unsigned int
+client_pixmap_bits_per_pixel(uint8_t depth)
+{
+    const xcb_setup_t *setup = xcb_get_setup(globalconf.connection);
+    xcb_format_iterator_t formats = xcb_setup_pixmap_formats_iterator(setup);
+    for (; formats.rem; xcb_format_next(&formats))
+        if (formats.data->depth == depth)
+            return formats.data->bits_per_pixel;
+    return 0;
+}
+
+static bool
+client_bitmap_pixel(const uint8_t *data, size_t stride, int x, int y)
+{
+    const xcb_setup_t *setup = xcb_get_setup(globalconf.connection);
+    const uint8_t byte = data[y * stride + x / 8];
+    const uint8_t bit = x % 8;
+    return (byte >> (setup->bitmap_format_bit_order == XCB_IMAGE_ORDER_MSB_FIRST
+                     ? 7 - bit : bit)) & 1;
+}
+
+static awesome_skia_image_t *
+client_image_from_drawable(xcb_drawable_t drawable, xcb_pixmap_t mask,
+                          const xcb_get_geometry_reply_t *icon_geometry)
+{
+    const xcb_setup_t *setup = xcb_get_setup(globalconf.connection);
+    const int width = icon_geometry->width;
+    const int height = icon_geometry->height;
+    const uint8_t icon_depth = icon_geometry->depth;
+    const unsigned int bpp = icon_depth == 1 ? 1 : client_pixmap_bits_per_pixel(icon_depth);
+    const size_t icon_stride = ((width * bpp + setup->bitmap_format_scanline_pad - 1) /
+                                setup->bitmap_format_scanline_pad) *
+                               (setup->bitmap_format_scanline_pad / 8);
+    xcb_get_image_reply_t *icon_reply = NULL;
+    xcb_get_image_reply_t *mask_reply = NULL;
+    uint32_t *pixels = NULL;
+    awesome_skia_image_t *result = NULL;
+
+    if (!bpp)
+        return NULL;
+    icon_reply = xcb_get_image_reply(globalconf.connection,
+        xcb_get_image_unchecked(globalconf.connection,
+            icon_depth == 1 ? XCB_IMAGE_FORMAT_XY_BITMAP : XCB_IMAGE_FORMAT_Z_PIXMAP,
+            drawable, 0, 0, width, height, UINT32_MAX), NULL);
+    if (!icon_reply || xcb_get_image_data_length(icon_reply) < icon_stride * (size_t) height)
+        goto out;
+    if (mask) {
+        const size_t mask_stride = ((width + setup->bitmap_format_scanline_pad - 1) /
+                                    setup->bitmap_format_scanline_pad) *
+                                   (setup->bitmap_format_scanline_pad / 8);
+        mask_reply = xcb_get_image_reply(globalconf.connection,
+            xcb_get_image_unchecked(globalconf.connection, XCB_IMAGE_FORMAT_XY_BITMAP,
+                                    mask, 0, 0, width, height, 1), NULL);
+        if (!mask_reply || xcb_get_image_data_length(mask_reply) < mask_stride * (size_t) height)
+            goto out;
+    }
+
+    pixels = p_new(uint32_t, (size_t) width * height);
+    const uint8_t *icon_data = xcb_get_image_data(icon_reply);
+    const uint8_t *mask_data = mask_reply ? xcb_get_image_data(mask_reply) : NULL;
+    const size_t mask_stride = ((width + setup->bitmap_format_scanline_pad - 1) /
+                                setup->bitmap_format_scanline_pad) *
+                               (setup->bitmap_format_scanline_pad / 8);
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) {
+            uint8_t red, green, blue;
+            bool opaque = mask_data
+                ? client_bitmap_pixel(mask_data, mask_stride, x, y)
+                : icon_depth != 1 || client_bitmap_pixel(icon_data, icon_stride, x, y);
+            if (icon_depth == 1) {
+                red = green = blue = client_bitmap_pixel(icon_data, icon_stride, x, y) ? 255 : 0;
+            } else {
+                uint32_t pixel = 0;
+                const uint8_t *source = icon_data + y * icon_stride + x * (bpp / 8);
+                if (setup->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST)
+                    for (unsigned int byte = 0; byte < bpp / 8; byte++)
+                        pixel |= (uint32_t) source[byte] << (byte * 8);
+                else
+                    for (unsigned int byte = 0; byte < bpp / 8; byte++)
+                        pixel = (pixel << 8) | source[byte];
+                red = client_unpack_visual_component(pixel, globalconf.default_visual->red_mask);
+                green = client_unpack_visual_component(pixel, globalconf.default_visual->green_mask);
+                blue = client_unpack_visual_component(pixel, globalconf.default_visual->blue_mask);
+            }
+            pixels[y * width + x] = (opaque ? 0xff000000u : 0) |
+                                    ((uint32_t) red << 16) |
+                                    ((uint32_t) green << 8) | blue;
+        }
+    result = draw_image_from_data(width, height, pixels);
+out:
+    p_delete(&pixels);
+    p_delete(&mask_reply);
+    p_delete(&icon_reply);
+    return result;
+}
+
+/** Set a client icon from legacy ICCCM pixmaps without making a Cairo XCB
+ * surface. The pixels become a Skia image and are uploaded on first draw. */
 void
 client_set_icon_from_pixmaps(client_t *c, xcb_pixmap_t icon, xcb_pixmap_t mask)
 {
-    xcb_get_geometry_cookie_t geom_icon_c, geom_mask_c;
-    xcb_get_geometry_reply_t *geom_icon_r, *geom_mask_r = NULL;
-    cairo_surface_t *s_icon, *result;
+    xcb_get_geometry_reply_t *icon_geometry = xcb_get_geometry_reply(globalconf.connection,
+        xcb_get_geometry_unchecked(globalconf.connection, icon), NULL);
+    xcb_get_geometry_reply_t *mask_geometry = mask ? xcb_get_geometry_reply(globalconf.connection,
+        xcb_get_geometry_unchecked(globalconf.connection, mask), NULL) : NULL;
+    awesome_skia_image_t *image = NULL;
 
-    geom_icon_c = xcb_get_geometry_unchecked(globalconf.connection, icon);
-    if (mask)
-        geom_mask_c = xcb_get_geometry_unchecked(globalconf.connection, mask);
-    geom_icon_r = xcb_get_geometry_reply(globalconf.connection, geom_icon_c, NULL);
-    if (mask)
-        geom_mask_r = xcb_get_geometry_reply(globalconf.connection, geom_mask_c, NULL);
-
-    if (!geom_icon_r || (mask && !geom_mask_r))
+    if (!icon_geometry || (mask && !mask_geometry))
         goto out;
-    if ((geom_icon_r->depth != 1 && geom_icon_r->depth != globalconf.screen->root_depth)
-            || (geom_mask_r && geom_mask_r->depth != 1))
-    {
-        warn("Got pixmaps with depth (%d, %d) while processing icon, but only depth 1 and %d are allowed",
-                geom_icon_r->depth, geom_mask_r ? geom_mask_r->depth : 0, globalconf.screen->root_depth);
+    if ((icon_geometry->depth != 1 && icon_geometry->depth != globalconf.screen->root_depth) ||
+        (mask_geometry && (mask_geometry->depth != 1 ||
+                           mask_geometry->width != icon_geometry->width ||
+                           mask_geometry->height != icon_geometry->height))) {
+        warn("Unsupported ICCCM icon pixmap depth or mask geometry");
         goto out;
     }
-
-    if (geom_icon_r->depth == 1)
-        s_icon = cairo_xcb_surface_create_for_bitmap(globalconf.connection,
-                globalconf.screen, icon, geom_icon_r->width, geom_icon_r->height);
-    else
-        s_icon = cairo_xcb_surface_create(globalconf.connection, icon, globalconf.default_visual,
-                geom_icon_r->width, geom_icon_r->height);
-    result = s_icon;
-
-    if (mask)
-    {
-        cairo_surface_t *s_mask;
-        cairo_t *cr;
-
-        result = cairo_surface_create_similar(s_icon, CAIRO_CONTENT_COLOR_ALPHA, geom_icon_r->width, geom_icon_r->height);
-        s_mask = cairo_xcb_surface_create_for_bitmap(globalconf.connection,
-                globalconf.screen, mask, geom_icon_r->width, geom_icon_r->height);
-        cr = cairo_create(result);
-
-        cairo_set_source_surface(cr, s_icon, 0, 0);
-        cairo_mask_surface(cr, s_mask, 0, 0);
-        cairo_surface_destroy(s_mask);
-        cairo_destroy(cr);
-    }
-
-    client_set_icon(c, result);
-
-    cairo_surface_destroy(result);
-    if (result != s_icon)
-        cairo_surface_destroy(s_icon);
-
+    image = client_image_from_drawable(icon, mask, icon_geometry);
+    client_set_icon(c, image);
 out:
-    p_delete(&geom_icon_r);
-    p_delete(&geom_mask_r);
+    awesome_skia_image_unref(image);
+    p_delete(&mask_geometry);
+    p_delete(&icon_geometry);
 }
 
 
@@ -3518,6 +3607,39 @@ titlebar_get_area(client_t *c, client_titlebar_t bar)
     return result;
 }
 
+/* Each titlebar gets a child of the client frame. It is a normal XCB Vulkan
+ * presentation target, so it never has to be rasterized into a pixmap. */
+static xcb_window_t
+titlebar_ensure_window(client_t *c, client_titlebar_t bar)
+{
+    xcb_window_t *window = &c->titlebar[bar].window;
+    if (*window != XCB_NONE)
+        return *window;
+
+    *window = xcb_generate_id(globalconf.connection);
+    xcb_create_window(globalconf.connection, globalconf.default_depth, *window,
+                      c->frame_window, 0, 0, 1, 1, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT, globalconf.visual->visual_id,
+                      XCB_CW_EVENT_MASK, (const uint32_t []) {
+                          XCB_EVENT_MASK_EXPOSURE
+                      });
+    xcb_map_window(globalconf.connection, *window);
+    return *window;
+}
+
+static void
+titlebar_configure_window(client_t *c, client_titlebar_t bar, area_t area)
+{
+    const uint32_t values[] = {
+        (uint32_t) area.x, (uint32_t) area.y,
+        area.width ? area.width : 1, area.height ? area.height : 1,
+    };
+    xcb_configure_window(globalconf.connection, titlebar_ensure_window(c, bar),
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                         values);
+}
+
 drawable_t *
 client_get_drawable_offset(client_t *c, int *x, int *y)
 {
@@ -3545,24 +3667,12 @@ client_get_drawable(client_t *c, int x, int y)
 static void
 client_refresh_titlebar_partial(client_t *c, client_titlebar_t bar, int16_t x, int16_t y, uint16_t width, uint16_t height)
 {
-    if(c->titlebar[bar].drawable == NULL
-            || c->titlebar[bar].drawable->pixmap == XCB_NONE
-            || !c->titlebar[bar].drawable->refreshed)
-        return;
-
-    /* Is the titlebar part of the area that should get redrawn? */
-    area_t area = titlebar_get_area(c, bar);
-    if (AREA_LEFT(area) >= x + width || AREA_RIGHT(area) <= x)
-        return;
-    if (AREA_TOP(area) >= y + height || AREA_BOTTOM(area) <= y)
-        return;
-
-    /* Redraw the affected parts. A Skia raster drawable has no Cairo surface;
-     * it has already uploaded its pixels into the pixmap. */
-    if (c->titlebar[bar].drawable->surface)
-        cairo_surface_flush(c->titlebar[bar].drawable->surface);
-    xcb_copy_area(globalconf.connection, c->titlebar[bar].drawable->pixmap, c->frame_window,
-            globalconf.gc, x - area.x, y - area.y, x, y, width, height);
+    (void) c;
+    (void) bar;
+    (void) x;
+    (void) y;
+    (void) width;
+    (void) height;
 }
 
 #define HANDLE_TITLEBAR_REFRESH(name, index)                                                \
@@ -3594,38 +3704,13 @@ titlebar_get_drawable(lua_State *L, client_t *c, int cl_idx, client_titlebar_t b
     if (c->titlebar[bar].drawable == NULL)
     {
         cl_idx = luaA_absindex(L, cl_idx);
-        switch (bar) {
-        case CLIENT_TITLEBAR_TOP:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_top, c
-#ifdef WITH_SKIA_VULKAN
-                               , XCB_NONE
-#endif
-                               );
-            break;
-        case CLIENT_TITLEBAR_BOTTOM:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_bottom, c
-#ifdef WITH_SKIA_VULKAN
-                               , XCB_NONE
-#endif
-                               );
-            break;
-        case CLIENT_TITLEBAR_RIGHT:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_right, c
-#ifdef WITH_SKIA_VULKAN
-                               , XCB_NONE
-#endif
-                               );
-            break;
-        case CLIENT_TITLEBAR_LEFT:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_left, c
-#ifdef WITH_SKIA_VULKAN
-                               , XCB_NONE
-#endif
-                               );
-            break;
-        default:
-            fatal("Unknown titlebar kind %d\n", (int) bar);
-        }
+        drawable_refresh_callback *callbacks[] = {
+            (drawable_refresh_callback *) client_refresh_titlebar_top,
+            (drawable_refresh_callback *) client_refresh_titlebar_right,
+            (drawable_refresh_callback *) client_refresh_titlebar_bottom,
+            (drawable_refresh_callback *) client_refresh_titlebar_left,
+        };
+        drawable_allocator(L, callbacks[bar], c, titlebar_ensure_window(c, bar));
         c->titlebar[bar].drawable = luaA_object_ref_item(L, cl_idx, -1);
     }
 
@@ -3850,10 +3935,11 @@ luaA_client_set_maximized_vertical(lua_State *L, client_t *c)
 static int
 luaA_client_set_icon(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = NULL;
+    awesome_skia_image_t *image = NULL;
     if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-    client_set_icon(c, surf);
+        image = awesome_skia_image_from_lua(L, -1);
+    client_set_icon(c, image);
+    awesome_skia_image_unref(image);
     return 0;
 }
 
@@ -4052,19 +4138,13 @@ luaA_client_get_motif_wm_hints(lua_State *L, client_t *c)
 static int
 luaA_client_get_content(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surface;
-    int width  = c->geometry.width;
-    int height = c->geometry.height;
-
-    /* Just the client size without decorations */
-    width  -= c->titlebar[CLIENT_TITLEBAR_LEFT].size + c->titlebar[CLIENT_TITLEBAR_RIGHT].size;
-    height -= c->titlebar[CLIENT_TITLEBAR_TOP].size + c->titlebar[CLIENT_TITLEBAR_BOTTOM].size;
-
-    surface = cairo_xcb_surface_create(globalconf.connection, c->window,
-                                       c->visualtype, width, height);
-
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surface);
+    xcb_get_geometry_reply_t *geometry = xcb_get_geometry_reply(globalconf.connection,
+        xcb_get_geometry_unchecked(globalconf.connection, c->window), NULL);
+    awesome_skia_image_t *image = geometry
+        ? client_image_from_drawable(c->window, XCB_NONE, geometry) : NULL;
+    p_delete(&geometry);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4077,14 +4157,14 @@ luaA_client_get_icon(lua_State *L, client_t *c)
     /* Pick the closest available size, only picking a smaller icon if no bigger
      * one is available.
      */
-    cairo_surface_t *found = NULL;
+    awesome_skia_image_t *found = NULL;
     int found_size = 0;
     int preferred_size = globalconf.preferred_icon_size;
 
     foreach(surf, c->icons)
     {
-        int width = cairo_image_surface_get_width(*surf);
-        int height = cairo_image_surface_get_height(*surf);
+        int width = awesome_skia_image_width(*surf);
+        int height = awesome_skia_image_height(*surf);
         int size = MAX(width, height);
 
         /* pick the icon if it's a better match than the one we already have */
@@ -4101,8 +4181,7 @@ luaA_client_get_icon(lua_State *L, client_t *c)
         }
     }
 
-    /* lua gets its own reference which it will have to destroy */
-    lua_pushlightuserdata(L, cairo_surface_reference(found));
+    awesome_skia_image_push_lua(L, found);
     return 1;
 }
 
@@ -4256,11 +4335,11 @@ luaA_client_get_size_hints(lua_State *L, client_t *c)
 static int
 luaA_client_get_client_shape_bounding(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->window, XCB_SHAPE_SK_BOUNDING);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->window, XCB_SHAPE_SK_BOUNDING);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4272,11 +4351,11 @@ luaA_client_get_client_shape_bounding(lua_State *L, client_t *c)
 static int
 luaA_client_get_shape_bounding(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_BOUNDING);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_BOUNDING);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4288,13 +4367,10 @@ luaA_client_get_shape_bounding(lua_State *L, client_t *c)
 static int
 luaA_client_set_shape_bounding(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-    xwindow_set_shape(c->frame_window,
+    xwindow_set_shape(L, -1, c->frame_window,
             c->geometry.width + (c->border_width * 2),
             c->geometry.height + (c->border_width * 2),
-            XCB_SHAPE_SK_BOUNDING, surf, -c->border_width);
+            XCB_SHAPE_SK_BOUNDING, -c->border_width);
     luaA_object_emit_signal(L, -3, "property::shape_bounding", 0);
     return 0;
 }
@@ -4307,11 +4383,11 @@ luaA_client_set_shape_bounding(lua_State *L, client_t *c)
 static int
 luaA_client_get_client_shape_clip(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->window, XCB_SHAPE_SK_CLIP);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->window, XCB_SHAPE_SK_CLIP);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4323,11 +4399,11 @@ luaA_client_get_client_shape_clip(lua_State *L, client_t *c)
 static int
 luaA_client_get_shape_clip(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_CLIP);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_CLIP);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4339,11 +4415,8 @@ luaA_client_get_shape_clip(lua_State *L, client_t *c)
 static int
 luaA_client_set_shape_clip(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-    xwindow_set_shape(c->frame_window, c->geometry.width, c->geometry.height,
-            XCB_SHAPE_SK_CLIP, surf, 0);
+    xwindow_set_shape(L, -1, c->frame_window, c->geometry.width, c->geometry.height,
+            XCB_SHAPE_SK_CLIP, 0);
     luaA_object_emit_signal(L, -3, "property::shape_clip", 0);
     return 0;
 }
@@ -4356,11 +4429,11 @@ luaA_client_set_shape_clip(lua_State *L, client_t *c)
 static int
 luaA_client_get_client_shape_input(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->window, XCB_SHAPE_SK_INPUT);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->window, XCB_SHAPE_SK_INPUT);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4372,11 +4445,11 @@ luaA_client_get_client_shape_input(lua_State *L, client_t *c)
 static int
 luaA_client_get_shape_input(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_INPUT);
-    if (!surf)
+    awesome_skia_image_t *image = xwindow_get_shape(c->frame_window, XCB_SHAPE_SK_INPUT);
+    if (!image)
         return 0;
-    /* lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(L, surf);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 
@@ -4388,13 +4461,10 @@ luaA_client_get_shape_input(lua_State *L, client_t *c)
 static int
 luaA_client_set_shape_input(lua_State *L, client_t *c)
 {
-    cairo_surface_t *surf = NULL;
-    if(!lua_isnil(L, -1))
-        surf = (cairo_surface_t *)lua_touserdata(L, -1);
-    xwindow_set_shape(c->frame_window,
+    xwindow_set_shape(L, -1, c->frame_window,
             c->geometry.width + (c->border_width * 2),
             c->geometry.height + (c->border_width * 2),
-            XCB_SHAPE_SK_INPUT, surf, -c->border_width);
+            XCB_SHAPE_SK_INPUT, -c->border_width);
     luaA_object_emit_signal(L, -3, "property::shape_input", 0);
     return 0;
 }
@@ -4438,10 +4508,10 @@ luaA_client_get_icon_sizes(lua_State *L, client_t *c)
         /* Create a table { width, height } and append it to the table */
         lua_createtable(L, 2, 0);
 
-        lua_pushinteger(L, cairo_image_surface_get_width(*s));
+        lua_pushinteger(L, awesome_skia_image_width(*s));
         lua_rawseti(L, -2, 1);
 
-        lua_pushinteger(L, cairo_image_surface_get_height(*s));
+        lua_pushinteger(L, awesome_skia_image_height(*s));
         lua_rawseti(L, -2, 2);
 
         lua_rawseti(L, -2, index++);
@@ -4465,8 +4535,7 @@ luaA_client_get_icon_sizes(lua_State *L, client_t *c)
  * returned to the caller).
  *
  * @tparam integer index The index in the list of icons to get.
- * @treturn surface A lightuserdata for a cairo surface. This reference must be
- * destroyed!
+ * @treturn skia.Image An immutable Skia image.
  * @method get_icon
  * @see icon_sizes
  * @see awful.widget.clienticon
@@ -4478,7 +4547,7 @@ luaA_client_get_some_icon(lua_State *L)
     int index = luaL_checkinteger(L, 2);
     luaL_argcheck(L, (index >= 1 && index <= c->icons.len), 2,
             "invalid icon index");
-    lua_pushlightuserdata(L, cairo_surface_reference(c->icons.tab[index-1]));
+    awesome_skia_image_push_lua(L, c->icons.tab[index-1]);
     return 1;
 }
 

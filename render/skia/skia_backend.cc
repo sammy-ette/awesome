@@ -220,94 +220,6 @@ struct awesome_skia_renderer
     size_t next_sync = 0;
     awesome_skia_frame *active_frame = nullptr;
 
-    /* Raster mode. Client titlebars share one frame window between up to four
-     * drawables, so they cannot each own a swapchain. They render into a CPU
-     * surface which is uploaded to the X pixmap they already used, leaving
-     * Awesome's existing pixmap-to-window blit untouched. Only the target
-     * differs; the Lua-facing canvas is identical to a GPU frame's. */
-    bool raster = false;
-    xcb_drawable_t raster_target = XCB_NONE;
-    xcb_gcontext_t raster_gc = XCB_NONE;
-    uint8_t raster_depth = 0;
-    sk_sp<SkSurface> raster_surface;
-
-    bool create_raster_surface(uint32_t width, uint32_t height,
-                               char *error, size_t error_size)
-    {
-        requested_width = width;
-        requested_height = height;
-        raster_surface = SkSurfaces::Raster(SkImageInfo::Make(
-            static_cast<int>(std::max<uint32_t>(width, 1)),
-            static_cast<int>(std::max<uint32_t>(height, 1)),
-            kBGRA_8888_SkColorType, kPremul_SkAlphaType));
-        if (!raster_surface)
-        {
-            set_error(error, error_size, "Could not create the raster Skia surface");
-            return false;
-        }
-        return true;
-    }
-
-    awesome_skia_frame *begin_raster_frame(char *error, size_t error_size)
-    {
-        if (!raster_surface && !create_raster_surface(requested_width, requested_height,
-                                                      error, error_size))
-            return nullptr;
-        if (active_frame)
-        {
-            set_error(error, error_size, "A Skia frame is already in progress");
-            return nullptr;
-        }
-        auto *frame = new awesome_skia_frame();
-        frame->renderer = this;
-        frame->surface = raster_surface.get();
-        frame->canvas = raster_surface->getCanvas();
-        active_frame = frame;
-        return frame;
-    }
-
-    /* Upload the rendered pixels into the pixmap. X caps the size of a single
-     * request, so send horizontal bands rather than the whole image at once. */
-    bool end_raster_frame(awesome_skia_frame *frame, char *error, size_t error_size)
-    {
-        std::unique_ptr<awesome_skia_frame> owned(frame);
-        if (!frame || frame != active_frame || frame->renderer != this)
-        {
-            set_error(error, error_size, "The Skia frame does not belong to this renderer");
-            return false;
-        }
-        active_frame = nullptr;
-
-        SkPixmap pixmap;
-        if (!raster_surface || !raster_surface->peekPixels(&pixmap))
-        {
-            set_error(error, error_size, "Could not read back the raster Skia surface");
-            return false;
-        }
-
-        const uint32_t width = static_cast<uint32_t>(pixmap.width());
-        const uint32_t height = static_cast<uint32_t>(pixmap.height());
-        const size_t stride = pixmap.rowBytes();
-
-        uint32_t max_request = xcb_get_maximum_request_length(connection);
-        if (max_request > 4096)
-            max_request -= 4096; /* leave room for the request header itself */
-        uint32_t rows_per_band = stride ? static_cast<uint32_t>((max_request * 4) / stride) : height;
-        rows_per_band = std::clamp<uint32_t>(rows_per_band, 1, height ? height : 1);
-
-        for (uint32_t y = 0; y < height; y += rows_per_band)
-        {
-            const uint32_t rows = std::min(rows_per_band, height - y);
-            const auto *data = static_cast<const uint8_t *>(pixmap.addr(0, static_cast<int>(y)));
-            xcb_put_image(connection, XCB_IMAGE_FORMAT_Z_PIXMAP, raster_target, raster_gc,
-                          static_cast<uint16_t>(width), static_cast<uint16_t>(rows),
-                          0, static_cast<int16_t>(y), 0, raster_depth,
-                          static_cast<uint32_t>(rows * stride), data);
-        }
-        xcb_flush(connection);
-        return true;
-    }
-
     void destroy_frame_sync()
     {
         for (const frame_sync_t& sync : frame_sync)
@@ -473,15 +385,20 @@ struct awesome_skia_renderer
 
             for (uint32_t index = 0; index < queue_count; ++index)
             {
-                VkBool32 present_supported = VK_FALSE;
-                result = vkGetPhysicalDeviceSurfaceSupportKHR(candidate, index,
-                                                              xcb_surface,
-                                                              &present_supported);
-                if (result != VK_SUCCESS)
+                if (!(queues[index].queueFlags & VK_QUEUE_GRAPHICS_BIT))
                     continue;
 
-                if ((queues[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                    present_supported == VK_TRUE)
+                VkBool32 present_supported = VK_TRUE;
+                if (xcb_surface != VK_NULL_HANDLE)
+                {
+                    result = vkGetPhysicalDeviceSurfaceSupportKHR(candidate, index,
+                                                                  xcb_surface,
+                                                                  &present_supported);
+                    if (result != VK_SUCCESS)
+                        continue;
+                }
+
+                if (present_supported == VK_TRUE)
                 {
                     physical_device = candidate;
                     queue_family = index;
@@ -842,8 +759,6 @@ struct awesome_skia_renderer
 
     awesome_skia_frame *begin_frame(char *error, size_t error_size)
     {
-        if (raster)
-            return begin_raster_frame(error, error_size);
         if (!skia_context || swapchain == VK_NULL_HANDLE || skia_surfaces.empty())
         {
             set_error(error, error_size, "The Skia renderer is not initialized");
@@ -918,8 +833,6 @@ struct awesome_skia_renderer
 
     bool end_frame(awesome_skia_frame *frame, char *error, size_t error_size)
     {
-        if (raster)
-            return end_raster_frame(frame, error, error_size);
         std::unique_ptr<awesome_skia_frame> owned_frame(frame);
         if (!frame || frame != active_frame || frame->renderer != this)
         {
@@ -1028,16 +941,6 @@ struct awesome_skia_renderer
 
     void destroy()
     {
-        if (raster)
-        {
-            if (active_frame)
-            {
-                delete active_frame;
-                active_frame = nullptr;
-            }
-            raster_surface.reset();
-            return;
-        }
         if (gpu && device != VK_NULL_HANDLE)
             vkDeviceWaitIdle(device);
 
@@ -1118,35 +1021,7 @@ extern "C" awesome_skia_renderer_t *awesome_skia_renderer_create(
         renderer->destroy();
         return nullptr;
     }
-
     global_shared_gpu = renderer->gpu;
-    return renderer.release();
-}
-
-extern "C" awesome_skia_renderer_t *awesome_skia_renderer_create_raster(
-    xcb_connection_t *connection,
-    xcb_drawable_t target,
-    xcb_gcontext_t gc,
-    uint8_t depth,
-    uint32_t width,
-    uint32_t height,
-    char *error,
-    size_t error_size)
-{
-    if (!connection || target == XCB_NONE)
-    {
-        set_error(error, error_size, "A connection and target drawable are required");
-        return nullptr;
-    }
-
-    auto renderer = std::make_unique<awesome_skia_renderer>();
-    renderer->connection = connection;
-    renderer->raster = true;
-    renderer->raster_target = target;
-    renderer->raster_gc = gc;
-    renderer->raster_depth = depth;
-    if (!renderer->create_raster_surface(width, height, error, error_size))
-        return nullptr;
     return renderer.release();
 }
 
@@ -1170,8 +1045,6 @@ extern "C" bool awesome_skia_renderer_resize(
         set_error(error, error_size, "Renderer is null");
         return false;
     }
-    if (renderer->raster)
-        return renderer->create_raster_surface(width, height, error, error_size);
     return renderer->create_swapchain(width, height, error, error_size);
 }
 

@@ -12,7 +12,7 @@ local pairs = pairs
 local setmetatable = setmetatable
 local base = require("wibox.widget.base")
 local gcolor = require("gears.color")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local gtable = require("gears.table")
 
 local margin = { mt = {} }
@@ -33,7 +33,7 @@ function margin:draw(_, cr, width, height)
         cr:set_source(color)
         cr:rectangle(0, 0, width, height)
         cr:rectangle(x, y, width - x - w, height - y - h)
-        cr:set_fill_rule(cairo.FillRule.EVEN_ODD)
+        cr:set_fill_rule(skia.FillRule.EVEN_ODD)
         cr:fill()
     end
 end

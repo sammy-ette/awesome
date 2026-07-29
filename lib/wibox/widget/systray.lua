@@ -9,7 +9,6 @@
 
 local wbase = require("wibox.widget.base")
 local drawable = require("wibox.drawable")
-local cairo = require("lgi").cairo
 local beautiful = require("beautiful")
 local gcolor = require("gears.color")
 local gtable = require("gears.table")
@@ -111,12 +110,11 @@ function systray:draw(context, cr, width, height)
     end
     local surf_raw = capi.awesome.systray_surface(surf_width, surf_height)
     if surf_raw then
-        local surf = cairo.Surface(surf_raw, true)
         if not beautiful.systray_skip_bg then
             cr:set_source(gcolor(bg))
             cr:paint()
         end
-        cr:set_source_surface(surf, 0, 0)
+        cr:set_source_surface(surf_raw, 0, 0)
         cr:paint()
     end
 end

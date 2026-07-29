@@ -925,7 +925,7 @@ function module.transform(shape)
     -- Apply the transformation matrix and apply the shape, then restore
     local function apply(self, cr, width, height, ...)
         cr:save()
-        cr:transform(self.matrix:to_native())
+        cr:transform(self.matrix)
         shape(cr, width, height, ...)
         cr:restore()
     end

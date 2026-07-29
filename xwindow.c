@@ -25,7 +25,7 @@
 
 #include <xcb/xcb.h>
 #include <xcb/shape.h>
-#include <cairo-xcb.h>
+#include <string.h>
 
 /** Mask shorthands */
 #define BUTTONMASK     (XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE)
@@ -259,8 +259,8 @@ xwindow_set_border_color(xcb_window_t w, color_t *color)
         xcb_change_window_attributes(globalconf.connection, w, XCB_CW_BORDER_PIXEL, &color->pixel);
 }
 
-/** Get one of a window's shapes as a cairo surface */
-cairo_surface_t *
+/** Get one of a window's shapes as an alpha Skia image. */
+awesome_skia_image_t *
 xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
 {
     if (!globalconf.have_shape)
@@ -279,8 +279,7 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
         if (!geom)
         {
             xcb_discard_reply(globalconf.connection, rcookie.sequence);
-            /* Create a cairo surface in an error state */
-            return cairo_image_surface_create(CAIRO_FORMAT_INVALID, -1, -1);
+            return NULL;
         }
         x = 0;
         y = 0;
@@ -296,8 +295,7 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
         if (!extents)
         {
             xcb_discard_reply(globalconf.connection, rcookie.sequence);
-            /* Create a cairo surface in an error state */
-            return cairo_image_surface_create(CAIRO_FORMAT_INVALID, -1, -1);
+            return NULL;
         }
 
         if (kind == XCB_SHAPE_SK_BOUNDING)
@@ -327,71 +325,65 @@ xwindow_get_shape(xcb_window_t win, enum xcb_shape_sk_t kind)
     xcb_shape_get_rectangles_reply_t *rects_reply = xcb_shape_get_rectangles_reply(globalconf.connection, rcookie, NULL);
     if (!rects_reply)
     {
-        /* Create a cairo surface in an error state */
-        return cairo_image_surface_create(CAIRO_FORMAT_INVALID, -1, -1);
+        return NULL;
     }
 
-    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_A1, width, height);
-    cairo_t *cr = cairo_create(surface);
+    uint32_t *pixels = p_new(uint32_t, (size_t) width * height);
+    memset(pixels, 0, (size_t) width * height * sizeof(*pixels));
     int num_rects = xcb_shape_get_rectangles_rectangles_length(rects_reply);
     xcb_rectangle_t *rects = xcb_shape_get_rectangles_rectangles(rects_reply);
-
-    cairo_surface_set_device_offset(surface, -x, -y);
-    cairo_set_fill_rule(cr, CAIRO_FILL_RULE_WINDING);
-
     for (int i = 0; i < num_rects; i++)
-        cairo_rectangle(cr, rects[i].x, rects[i].y, rects[i].width, rects[i].height);
-    cairo_fill(cr);
+        for (int yy = MAX(0, rects[i].y - y);
+             yy < MIN(height, rects[i].y - y + rects[i].height); yy++)
+            for (int xx = MAX(0, rects[i].x - x);
+                 xx < MIN(width, rects[i].x - x + rects[i].width); xx++)
+                pixels[yy * width + xx] = 0xffffffffu;
 
-    cairo_destroy(cr);
+    awesome_skia_image_t *result = draw_image_from_data(width, height, pixels);
+    p_delete(&pixels);
     free(rects_reply);
-    return surface;
+    return result;
 }
 
-/** Turn a cairo surface into a pixmap with depth 1 */
-static xcb_pixmap_t
-xwindow_shape_pixmap(int width, int height, cairo_surface_t *surf)
-{
-    xcb_pixmap_t pixmap = xcb_generate_id(globalconf.connection);
-    cairo_surface_t *dest;
-    cairo_t *cr;
-
-    if (width <= 0 || height <= 0)
-        return XCB_NONE;
-
-    xcb_create_pixmap(globalconf.connection, 1, pixmap, globalconf.screen->root, width, height);
-    dest = cairo_xcb_surface_create_for_bitmap(globalconf.connection, globalconf.screen, pixmap, width, height);
-
-    cr = cairo_create(dest);
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_surface(cr, surf, 0, 0);
-    cairo_paint(cr);
-
-    cairo_destroy(cr);
-    cairo_surface_flush(dest);
-    cairo_surface_finish(dest);
-    cairo_surface_destroy(dest);
-
-    return pixmap;
-}
-
-/** Set one of a window's shapes */
+/** Set one of a window's shapes from a Skia alpha mask. */
 void
-xwindow_set_shape(xcb_window_t win, int width, int height, enum xcb_shape_sk_t kind, cairo_surface_t *surf, int offset)
+xwindow_set_shape(lua_State *L, int surface_index, xcb_window_t win, int width,
+                  int height, enum xcb_shape_sk_t kind, int offset)
 {
     if (!globalconf.have_shape)
         return;
     if (kind == XCB_SHAPE_SK_INPUT && !globalconf.have_input_shape)
         return;
 
-    xcb_pixmap_t pixmap = XCB_NONE;
-    if (surf)
-        pixmap = xwindow_shape_pixmap(width, height, surf);
+    if (lua_isnil(L, surface_index)) {
+        xcb_shape_mask(globalconf.connection, XCB_SHAPE_SO_SET, kind, win,
+                       offset, offset, XCB_NONE);
+        return;
+    }
 
-    xcb_shape_mask(globalconf.connection, XCB_SHAPE_SO_SET, kind, win, offset, offset, pixmap);
-
-    if (pixmap != XCB_NONE)
-        xcb_free_pixmap(globalconf.connection, pixmap);
+    uint8_t *alpha = p_new(uint8_t, (size_t) width * height);
+    if (!awesome_skia_alpha_mask_from_lua(L, surface_index, alpha, width, height)) {
+        p_delete(&alpha);
+        luaL_error(L, "shape must be a Skia surface or image matching the window size");
+        return;
+    }
+    xcb_rectangle_t *rectangles = p_new(xcb_rectangle_t, (size_t) width * height);
+    size_t count = 0;
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width;) {
+            while (x < width && alpha[y * width + x] < 128)
+                x++;
+            int start = x;
+            while (x < width && alpha[y * width + x] >= 128)
+                x++;
+            if (x > start)
+                rectangles[count++] = (xcb_rectangle_t) { start, y, x - start, 1 };
+        }
+    xcb_shape_rectangles(globalconf.connection, XCB_SHAPE_SO_SET, kind,
+                         XCB_CLIP_ORDERING_UNSORTED, win, offset, offset,
+                         count, rectangles);
+    p_delete(&rectangles);
+    p_delete(&alpha);
 }
 
 /** Calculate the position change that a window needs applied.

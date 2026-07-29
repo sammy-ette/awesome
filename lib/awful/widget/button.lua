@@ -14,8 +14,7 @@ local abutton = require("awful.button")
 local imagebox = require("wibox.widget.imagebox")
 local widget = require("wibox.widget.base")
 local surface = require("gears.surface")
-local skia = rawget(_G, "skia")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local gtable = require("gears.table")
 
 local button = { mt = {} }
@@ -41,19 +40,12 @@ function button.new(args)
 
     function w:set_image(image)
         img_release = surface.load(image)
-        if skia then
-            -- Same "pressed" look: the image nudged 2px down and right.
-            local iw, ih = img_release:get_width(), img_release:get_height()
-            local canvas = skia.new_image_surface(math.max(iw, 1), math.max(ih, 1))
-            canvas:draw_image(img_release, 2, 2)
-            img_press = canvas:snapshot()
-        else
-            img_press = img_release:create_similar(cairo.Content.COLOR_ALPHA,
-                img_release.width, img_release.height)
-            local cr = cairo.Context(img_press)
-            cr:set_source_surface(img_release, 2, 2)
-            cr:paint()
-        end
+        -- Same "pressed" look: the image nudged 2px down and right.
+        img_press = skia.ImageSurface(skia.Format.ARGB32,
+            math.max(img_release:get_width(), 1), math.max(img_release:get_height(), 1))
+        local cr = skia.Context(img_press)
+        cr:set_source_surface(img_release, 2, 2)
+        cr:paint()
         orig_set_image(self, img_release)
     end
     w:set_image(args.image)

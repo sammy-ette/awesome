@@ -20,7 +20,7 @@ local gmath = require("gears.math")
 local object = require("gears.object")
 local grect =  require("gears.geometry").rectangle
 local gsurf = require("gears.surface")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 
 local function get_screen(s)
     return s and capi.screen[s]
@@ -228,9 +228,8 @@ end
 function screen.object.get_content(s)
     local geo = s.geometry
     local source = gsurf(capi.root.content())
-    local target = source:create_similar(cairo.Content.COLOR, geo.width,
-                                         geo.height)
-    local cr = cairo.Context(target)
+    local target = skia.ImageSurface(skia.Format.RGB24, geo.width, geo.height)
+    local cr = skia.Context(target)
     cr:set_source_surface(source, -geo.x, -geo.y)
     cr:rectangle(0, 0, geo.width, geo.height)
     cr:fill()

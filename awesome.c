@@ -738,9 +738,6 @@ main(int argc, char **argv)
     if (globalconf.xrmdb == NULL)
         fatal("Failed to initialize xcb-xrm");
 
-    /* Did we get some usable data from the above X11 setup? */
-    draw_test_cairo_xcb();
-
     /* Acquire the WM_Sn selection */
     acquire_WM_Sn(default_init_flags & INIT_FLAG_REPLACE_WM);
 

@@ -13,7 +13,7 @@ local wibox     = require("wibox")
 local beautiful = require("beautiful")
 local color     = require("gears.color")
 local shape     = require("gears.shape")
-local cairo     = require("lgi").cairo
+local skia      = require("skia")
 local alayout   = require("awful.layout")
 
 local capi = {
@@ -46,13 +46,13 @@ local function show_placeholder(geo)
 
     placeholder_w:geometry(geo)
 
-    local img = cairo.ImageSurface(cairo.Format.A1, geo.width, geo.height)
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(skia.Format.A1, geo.width, geo.height)
+    local cr = skia.Context(img)
 
-    cr:set_operator(cairo.Operator.CLEAR)
+    cr:set_operator(skia.Operator.CLEAR)
     cr:set_source_rgba(0,0,0,1)
     cr:paint()
-    cr:set_operator(cairo.Operator.SOURCE)
+    cr:set_operator(skia.Operator.SOURCE)
     cr:set_source_rgba(1,1,1,1)
 
     local line_width = beautiful.snap_border_width or 5
@@ -67,7 +67,7 @@ local function show_placeholder(geo)
 
     cr:stroke()
 
-    placeholder_w.shape_bounding = img._native
+    placeholder_w.shape_bounding = img
     img:finish()
 
     placeholder_w.visible = true

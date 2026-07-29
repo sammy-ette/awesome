@@ -741,7 +741,7 @@ ewmh_window_icon_get_unchecked(xcb_window_t w)
                                     _NET_WM_ICON, XCB_ATOM_CARDINAL, 0, UINT32_MAX);
 }
 
-static cairo_surface_t *
+static awesome_skia_image_t *
 ewmh_window_icon_from_reply_next(uint32_t **data, uint32_t *data_end)
 {
     uint32_t width, height;
@@ -761,17 +761,17 @@ ewmh_window_icon_from_reply_next(uint32_t **data, uint32_t *data_end)
 
     icon_data = *data + 2;
     *data += 2 + data_len;
-    return draw_surface_from_data(width, height, icon_data);
+    return draw_image_from_data(width, height, icon_data);
 }
 
-static cairo_surface_array_t
+static awesome_skia_image_array_t
 ewmh_window_icon_from_reply(xcb_get_property_reply_t *r)
 {
     uint32_t *data, *data_end;
-    cairo_surface_array_t result;
-    cairo_surface_t *s;
+    awesome_skia_image_array_t result;
+    awesome_skia_image_t *image;
 
-    cairo_surface_array_init(&result);
+    awesome_skia_image_array_init(&result);
     if(!r || r->type != XCB_ATOM_CARDINAL || r->format != 32)
         return result;
 
@@ -780,8 +780,8 @@ ewmh_window_icon_from_reply(xcb_get_property_reply_t *r)
     if(!data)
         return result;
 
-    while ((s = ewmh_window_icon_from_reply_next(&data, data_end)) != NULL) {
-        cairo_surface_array_push(&result, s);
+    while ((image = ewmh_window_icon_from_reply_next(&data, data_end)) != NULL) {
+        awesome_skia_image_array_push(&result, image);
     }
 
     return result;
@@ -791,11 +791,11 @@ ewmh_window_icon_from_reply(xcb_get_property_reply_t *r)
  * \param cookie The cookie.
  * \return An array of icons.
  */
-cairo_surface_array_t
+awesome_skia_image_array_t
 ewmh_window_icon_get_reply(xcb_get_property_cookie_t cookie)
 {
     xcb_get_property_reply_t *r = xcb_get_property_reply(globalconf.connection, cookie, NULL);
-    cairo_surface_array_t result = ewmh_window_icon_from_reply(r);
+    awesome_skia_image_array_t result = ewmh_window_icon_from_reply(r);
     p_delete(&r);
     return result;
 }

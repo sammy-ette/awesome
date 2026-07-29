@@ -15,7 +15,6 @@ local type = type
 local ipairs = ipairs
 local capi = { button = button }
 local wibox = require("wibox")
-local gdebug = require("gears.debug")
 local dpi = require("beautiful").xresources.apply_dpi
 local base = require("wibox.widget.base")
 
@@ -171,18 +170,7 @@ function common.list_update(w, buttons, label, data, objects, args)
         if cache.bgb then
             cache.bgb:set_bg(bg)
 
-            --TODO v5 remove this if, it existed only for a removed and
-            -- undocumented API
-            if type(bg_image) ~= "function" or rawget(_G, "skia") then
-                cache.bgb:set_bgimage(bg_image)
-            else
-                gdebug.deprecate("If you read this, you used an undocumented API"..
-                    " which has been replaced by the new awful.widget.common "..
-                    "templating system, please migrate now. This feature is "..
-                    "already staged for removal", {
-                    deprecated_in = 4
-                })
-            end
+            cache.bgb:set_bgimage(bg_image)
 
             cache.bgb.shape        = item_args.shape
             cache.bgb.border_width = item_args.shape_border_width

@@ -8,7 +8,7 @@
 
 -- Grab environment we need
 local surface = require("gears.surface")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local capi =
 {
     client = client,
@@ -40,8 +40,8 @@ function shape.get_transformed(c, shape_name)
     -- Figure out the size of the shape that we need
     local img_width = geom.width + 2*border
     local img_height = geom.height + 2*border
-    local result = cairo.ImageSurface(cairo.Format.A1, img_width, img_height)
-    local cr = cairo.Context(result)
+    local result = skia.ImageSurface(skia.Format.A1, img_width, img_height)
+    local cr = skia.Context(result)
 
     -- Fill everything (this paints the titlebars and border).
     -- The `cr:paint()` below will have painted the whole surface, so
@@ -50,7 +50,7 @@ function shape.get_transformed(c, shape_name)
 
     if shape_img then
         -- Draw the client's shape in the middle
-        cr:set_operator(cairo.Operator.SOURCE)
+        cr:set_operator(skia.Operator.SOURCE)
         cr:set_source_surface(shape_img, border + l, border + t)
         cr:rectangle(border + l, border + t, geom.width - l - r, geom.height - t - b)
         cr:fill()
@@ -69,7 +69,7 @@ function shape.get_transformed(c, shape_name)
         -- Always call the shape with the size of the bounding shape
         _shape(cr, geom.width + 2*c.border_width, geom.height + 2*c.border_width)
         -- Now fill the "selected" part
-        cr:set_operator(cairo.Operator.SOURCE)
+        cr:set_operator(skia.Operator.SOURCE)
         cr:set_source_rgba(1, 1, 1, 1)
         cr:fill_preserve()
         if shape_name == "clip" then
@@ -81,7 +81,7 @@ function shape.get_transformed(c, shape_name)
         end
         -- Combine the result with what we already have
         cr:pop_group_to_source()
-        cr:set_operator(cairo.Operator.IN)
+        cr:set_operator(skia.Operator.IN)
         cr:paint()
 
         -- 'cr' is kept alive until Lua's GC frees it. Make sure it does not
@@ -106,7 +106,7 @@ end
 -- @tparam client c The client to act on
 function shape.update.bounding(c)
     local res = shape.get_transformed(c, "bounding")
-    c.shape_bounding = res and res._native
+    c.shape_bounding = res
     -- Free memory
     if res then
         res:finish()
@@ -118,7 +118,7 @@ end
 -- @tparam client c The client to act on
 function shape.update.clip(c)
     local res = shape.get_transformed(c, "clip")
-    c.shape_clip = res and res._native
+    c.shape_clip = res
     -- Free memory
     if res then
         res:finish()
@@ -130,7 +130,7 @@ end
 -- @client c The client to act on
 function shape.update.input(c)
     local res = shape.get_transformed(c, "input")
-    c.shape_input = res and res._native
+    c.shape_input = res
     -- Free memory
     if res then
         res:finish()

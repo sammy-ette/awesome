@@ -23,9 +23,10 @@
 #define AWESOME_COMMON_DRAW_H
 
 #include <xcb/xcb.h>
-#include <cairo.h>
 #include <lua.h>
 #include <glib.h> /* for GError */
+
+#include "render/skia/skia_lua.h"
 
 #include "common/array.h"
 #include "common/util.h"
@@ -51,23 +52,22 @@ struct area_t
         (a).width == (b).width && (a).height == (b).height)
 
 static inline void
-cairo_surface_array_destroy_surface(cairo_surface_t **s)
+awesome_skia_image_array_destroy_image(awesome_skia_image_t **image)
 {
-    cairo_surface_destroy(*s);
+    awesome_skia_image_unref(*image);
 }
-DO_ARRAY(cairo_surface_t *, cairo_surface, cairo_surface_array_destroy_surface)
+DO_ARRAY(awesome_skia_image_t *, awesome_skia_image,
+         awesome_skia_image_array_destroy_image)
 
-cairo_surface_t *draw_surface_from_data(int width, int height, uint32_t *data);
-cairo_surface_t *draw_dup_image_surface(cairo_surface_t *surface);
-cairo_surface_t *draw_load_image(lua_State *L, const char *path, GError **error);
-cairo_surface_t *draw_surface_from_pixbuf(GdkPixbuf *buf);
+awesome_skia_image_t *draw_image_from_pixbuf(GdkPixbuf *buf);
+awesome_skia_image_t *draw_load_skia_image(const char *path, GError **error);
+awesome_skia_image_t *draw_image_from_data(int width, int height,
+                                           const uint32_t *data);
 
 xcb_visualtype_t *draw_find_visual(const xcb_screen_t *s, xcb_visualid_t visual);
 xcb_visualtype_t *draw_default_visual(const xcb_screen_t *s);
 xcb_visualtype_t *draw_argb_visual(const xcb_screen_t *s);
 uint8_t draw_visual_depth(const xcb_screen_t *s, xcb_visualid_t vis);
-
-void draw_test_cairo_xcb(void);
 
 #endif
 // vim: filetype=c:expandtab:shiftwidth=4:tabstop=8:softtabstop=4:textwidth=80

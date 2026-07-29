@@ -8,7 +8,7 @@
 -- @utillib gears.wallpaper
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local color = require("gears.color")
 local surface = require("gears.surface")
 local timer = require("gears.timer")
@@ -24,6 +24,7 @@ end
 
 -- Information about a pending wallpaper change, see prepare_context()
 local pending_wallpaper = nil
+local legacy_wallpaper = nil
 
 local function get_screen(s)
     return s and screen[s]
@@ -49,7 +50,7 @@ function wallpaper.prepare_context(s)
     if not pending_wallpaper then
         -- Prepare a pending wallpaper
         source = surface(root.wallpaper())
-        target = source:create_similar(cairo.Content.COLOR, root_width, root_height)
+        target = skia.ImageSurface(skia.Format.RGB24, root_width, root_height)
 
         -- Set the wallpaper (delayed)
         timer.delayed_call(function()
@@ -61,19 +62,19 @@ function wallpaper.prepare_context(s)
     elseif root_width > pending_wallpaper.width or root_height > pending_wallpaper.height then
         -- The root window was resized while a wallpaper is pending
         source = pending_wallpaper.surface
-        target = source:create_similar(cairo.Content.COLOR, root_width, root_height)
+        target = skia.ImageSurface(skia.Format.RGB24, root_width, root_height)
     else
         -- Draw to the already-pending wallpaper
         source = nil
         target = pending_wallpaper.surface
     end
 
-    cr = cairo.Context(target)
+    cr = skia.Context(target)
 
     if source then
         -- Copy the old wallpaper to the new one
         cr:save()
-        cr.operator = cairo.Operator.SOURCE
+        cr.operator = skia.Operator.SOURCE
         cr:set_source_surface(source, 0, 0)
         cr:paint()
         cr:restore()
@@ -101,16 +102,26 @@ end
 function wallpaper.set(pattern)
     debug.deprecate("Use `awful.wallpaper`", {deprecated_in=5})
 
-    if cairo.Surface:is_type_of(pattern) then
-        pattern = cairo.Pattern.create_for_surface(pattern)
+    if skia.Surface.is_type_of(pattern) then
+        pattern = skia.Pattern.create_for_surface(pattern)
     end
     if type(pattern) == "string" or type(pattern) == "table" then
         pattern = color(pattern)
     end
-    if not cairo.Pattern:is_type_of(pattern) then
+    if not skia.Pattern.is_type_of(pattern) then
         error("wallpaper.set() called with an invalid argument")
     end
-    root.wallpaper(pattern)
+    -- Desktop drawins are the Skia/Vulkan wallpaper backend. Retain the old
+    -- function's replace-in-place behaviour without going through an X root
+    -- pixmap or a Cairo pattern.
+    if legacy_wallpaper then
+        legacy_wallpaper:detach()
+    end
+    legacy_wallpaper = require("awful.wallpaper") {
+        bg = pattern,
+        screens = screen,
+    }
+    return true
 end
 
 --- Set a centered wallpaper.
@@ -136,7 +147,7 @@ function wallpaper.centered(surf, s, background, scale)
     end
 
     -- Fill the area with the background
-    cr.operator = cairo.Operator.SOURCE
+    cr.operator = skia.Operator.SOURCE
     cr.source = background
     cr:paint()
 
@@ -175,10 +186,10 @@ function wallpaper.tiled(surf, s, offset)
 
     local original_surf = surf
     surf = surface.load_uncached(surf)
-    local pattern = cairo.Pattern.create_for_surface(surf)
-    pattern.extend = cairo.Extend.REPEAT
+    local pattern = skia.Pattern.create_for_surface(surf)
+    pattern.extend = skia.Extend.REPEAT
     cr.source = pattern
-    cr.operator = cairo.Operator.SOURCE
+    cr.operator = skia.Operator.SOURCE
     cr:paint()
     if surf ~= original_surf then
         surf:finish()
@@ -221,7 +232,7 @@ function wallpaper.maximized(surf, s, ignore_aspect, offset)
     end
 
     cr:set_source_surface(surf, 0, 0)
-    cr.operator = cairo.Operator.SOURCE
+    cr.operator = skia.Operator.SOURCE
     cr:paint()
     if surf ~= original_surf then
         surf:finish()
@@ -248,7 +259,7 @@ function wallpaper.fit(surf, s, background)
     background = color(background)
 
     -- Fill the area with the background
-    cr.operator = cairo.Operator.SOURCE
+    cr.operator = skia.Operator.SOURCE
     cr.source = background
     cr:paint()
 

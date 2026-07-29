@@ -36,7 +36,7 @@ const char commands[] =
 "        '0.8.0', require('lgi.version')))\n"
 "end\n"
 "lgi = require('lgi')\n"
-"assert(lgi.cairo, lgi.Pango, lgi.PangoCairo, lgi.GLib, lgi.Gio, lgi.GdkPixbuf)\n"
+"assert(lgi.Pango, lgi.GLib, lgi.Gio, lgi.GdkPixbuf)\n"
 ;
 
 int main()

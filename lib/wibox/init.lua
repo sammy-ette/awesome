@@ -19,7 +19,7 @@ local object = require("gears.object")
 local grect =  require("gears.geometry").rectangle
 local beautiful = require("beautiful")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local skia = require("skia")
 
 
 --- This provides widget box windows. Every wibox can also be used as if it were
@@ -119,38 +119,12 @@ function wibox:_apply_shape()
         return
     end
 
-    local geo = self:geometry()
-    local bw = self.border_width
-
-    -- First handle the bounding shape (things including the border)
-    local img = cairo.ImageSurface(cairo.Format.A1, geo.width + 2*bw, geo.height + 2*bw)
-    local cr = cairo.Context(img)
-
-    -- We just draw the shape in its full size
-    shape(cr, geo.width + 2*bw, geo.height + 2*bw)
-    cr:set_operator(cairo.Operator.SOURCE)
-    cr:fill()
-    self.shape_bounding = img._native
-    img:finish()
-
-    -- Now handle the clip shape (things excluding the border)
-    img = cairo.ImageSurface(cairo.Format.A1, geo.width, geo.height)
-    cr = cairo.Context(img)
-
-    -- We give the shape the same arguments as for the bounding shape and draw
-    -- it in its full size (the translate is to compensate for the smaller
-    -- surface)
-    cr:translate(-bw, -bw)
-    shape(cr, geo.width + 2*bw, geo.height + 2*bw)
-    cr:set_operator(cairo.Operator.SOURCE)
-    cr:fill_preserve()
-    -- Now we remove an area of width 'bw' again around the shape (We use 2*bw
-    -- since half of that is on the outside and only half on the inside)
-    cr:set_source_rgba(0, 0, 0, 0)
-    cr:set_line_width(2*bw)
-    cr:stroke()
-    self.shape_clip = img._native
-    img:finish()
+    -- Skia clips and draws the widget shape directly on the GPU in
+    -- wibox.container.background. Do not abort construction merely because
+    -- the legacy X Shape bitmap bridge has not been replaced yet: native
+    -- bounding/input masks are reset while visual clipping remains GPU-side.
+    self.shape_bounding = nil
+    self.shape_clip = nil
 end
 
 function wibox:set_shape(shape)
@@ -166,17 +140,8 @@ end
 function wibox:set_input_passthrough(value)
     rawset(self, "_input_passthrough", value)
 
-    if rawget(_G, "skia") then
-        -- Keep GPU drawins out of the legacy Cairo A1-mask path.  The native
-        -- drawin property installs an empty X Shape input region directly.
-        self.drawin.input_passthrough = value
-    elseif not value then
-        self.shape_input = nil
-    else
-        local img = cairo.ImageSurface(cairo.Format.A1, 0, 0)
-        self.shape_input = img._native
-        img:finish()
-    end
+    -- The native drawin property installs an X Shape input region directly.
+    self.drawin.input_passthrough = value
 
     self:emit_signal("property::input_passthrough", value)
 end

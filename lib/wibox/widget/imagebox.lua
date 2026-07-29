@@ -24,14 +24,11 @@
 -- @supermodule wibox.widget.base
 ---------------------------------------------------------------------------
 
-local lgi = require("lgi")
-local cairo = lgi.cairo
-local skia = rawget(_G, "skia")
+local skia = require("skia")
 
 local base = require("wibox.widget.base")
 local surface = require("gears.surface")
 local gtable = require("gears.table")
-local gdebug = require("gears.debug")
 local gfs = require("gears.filesystem")
 local setmetatable = setmetatable
 local type = type
@@ -39,104 +36,31 @@ local math = math
 
 local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility with Lua 5.1)
 
--- Placeholder table to represent an emty stylesheet.
--- It has to be defined here to avoid being GCed
-local empty_stylesheet = {}
-
 local policies_to_extents = {
-    ["pad"]     = cairo.Extend.PAD,
-    ["repeat"]  = cairo.Extend.REPEAT,
-    ["reflect"] = cairo.Extend.REFLECT,
+    ["pad"]     = skia.Extend.PAD,
+    ["repeat"]  = skia.Extend.REPEAT,
+    ["reflect"] = skia.Extend.REFLECT,
 }
-
--- Safe load for optional Rsvg module
-local Rsvg = nil
-do
-    local success, err = pcall(function() Rsvg = lgi.Rsvg end)
-    if not success then
-        gdebug.print_warning(debug.traceback("Could not load Rsvg: " .. tostring(err)))
-    end
-end
 
 local imagebox = { mt = {} }
 
-local rsvg_handle_cache = setmetatable({}, { __mode = 'k' })
 local stylesheet_cache = {}
 
---Load rsvg handle form image file
--- @tparam string file Path to svg file.
--- @return Rsvg handle
--- @treturn table A table where cached data can be stored.
+-- SVGs are decoded by Skia directly. Retain this private function for callers
+-- which probe it, but do not reintroduce the RSVG/Cairo path.
 function imagebox._load_rsvg_handle(file, style)
-    -- Make sure this is called in the right order.
-    assert((not style) or (style and stylesheet_cache[style]))
-
-    local style_ref = style and stylesheet_cache[style] or empty_stylesheet
-
-    if not Rsvg then return end
-
-    local bucket = rsvg_handle_cache[file] or {}
-    local cache = (bucket[style_ref] or {})["handle"]
-
-    if cache then
-        return cache, bucket[style_ref]
-    end
-
-    local handle, err
-
-    if file:match("<[?]?xml") or file:match("<svg") then
-        handle, err = Rsvg.Handle.new_from_data(file)
-    else
-        handle, err = Rsvg.Handle.new_from_file(file)
-    end
-
-    if not err then
-        rsvg_handle_cache[file] = rsvg_handle_cache[file] or setmetatable({}, {__mode = "k"})
-        rsvg_handle_cache[file][style_ref] = rsvg_handle_cache[file][style_ref] or {}
-        rsvg_handle_cache[file][style_ref]["handle"] = handle
-        return handle, rsvg_handle_cache[file][style_ref]
-    end
+    return nil
 end
 
----Apply cairo surface for given imagebox widget
+--- Apply a Skia surface or image for a given imagebox widget.
 local function set_surface(ib, surf)
-    local is_surf_valid = surf.width > 0 and surf.height > 0
+    local is_surf_valid = surf:get_width() > 0 and surf:get_height() > 0
     if not is_surf_valid then return false end
 
-    ib._private.default = { width = surf.width, height = surf.height }
+    ib._private.default = { width = surf:get_width(), height = surf:get_height() }
     ib._private.handle = nil
     ib._private.image = surf
     return true
-end
-
----Apply RsvgHandle for given imagebox widget
-local function set_handle(ib, handle, cache)
-    local dim = handle:get_dimensions()
-    local is_handle_valid = dim.width > 0 and dim.height > 0
-    if not is_handle_valid then return false end
-
-    ib._private.default = { width = dim.width, height = dim.height }
-    ib._private.handle = handle
-    ib._private.cache = cache
-    ib._private.image = nil
-
-    return true
-end
-
----Try to load some image object from file then apply it to imagebox.
----@tparam table ib Imagebox
----@tparam string file Image file name
----@tparam function image_loader Function to load image object from file
----@tparam function image_setter Function to set image object to imagebox
----@treturn boolean True if image was successfully applied
-local function load_and_apply(ib, file, image_loader, image_setter)
-    local image_applied
-    local object, cache = image_loader(file, ib._private.stylesheet_og)
-
-    if object then
-        image_applied = image_setter(ib, object, cache)
-    end
-    return image_applied
 end
 
 --- Support both CSS data and filepath for the stylsheet.
@@ -173,51 +97,10 @@ end
 
 ---Update the cached size depending on the stylesheet and dpi.
 --
--- It's necessary because a single RSVG handle can be used by
--- many imageboxes. So DPI and Stylesheet need to be set each time.
 local function update_dpi(self, ctx)
-    if not self._private.handle then return end
-
-    local dpi = self._private.auto_dpi and
-        ctx.dpi or
-        self._private.dpi or
-        nil
-
-    local need_dpi = dpi and
-        self._private.last_dpi ~= dpi
-
-    local need_style = self._private.handle.set_stylesheet and
-        self._private.stylesheet
-
-    local old_size = self._private.default and self._private.default.width
-
-    if dpi and dpi ~= self._private.cache.dpi then
-        if type(dpi) == "table" then
-            self._private.handle:set_dpi_x_y(dpi.x, dpi.y)
-        else
-            self._private.handle:set_dpi(dpi)
-        end
-    end
-
-    if need_style and self._private.cache.stylesheet ~= self._private.stylesheet then
-        self._private.handle:set_stylesheet(self._private.stylesheet)
-    end
-
-    -- Reload the size.
-    if need_dpi or (need_style and self._private.stylesheet ~= self._private.last_stylesheet) then
-        set_handle(self, self._private.handle, self._private.cache)
-    end
-
-    self._private.last_dpi = dpi
-    self._private.cache.dpi = dpi
-    self._private.last_stylesheet = self._private.stylesheet
-    self._private.cache.stylesheet = self._private.stylesheet
-
-    -- This can happen in the constructor when `dpi` is set after `image`.
-    if old_size and old_size ~= self._private.default.width then
-        self:emit_signal("widget::redraw_needed")
-        self:emit_signal("widget::layout_changed")
-    end
+    -- Skia owns SVG decoding and scales on the GPU. There is no mutable RSVG
+    -- handle whose DPI has to be updated before each draw.
+    return self, ctx
 end
 
 -- Draw an imagebox with the given cairo context in the given geometry.
@@ -309,33 +192,15 @@ function imagebox:draw(ctx, cr, width, height)
         end
     end
 
-    if skia and skia.is_canvas(cr) then
-        if self._private.image then
-            cr:draw_image(self._private.image, 0, 0)
-        end
-    elseif self._private.handle then
-        self._private.handle:render_cairo(cr)
-    else
-        -- Yes, it is possible that the vertical or horizontal policies both
-        -- have extends, but Cairo doesn't support this. So be it.
-        local pol = policies_to_extents[policy.w]
-        pol = pol or policies_to_extents[policy.h]
-
-        if pol then
-            local pat = cairo.Pattern.create_for_surface(self._private.image)
-            pat:set_extend(pol)
-            cr:set_source(pat)
-        else
-            cr:set_source_surface(self._private.image, 0, 0)
-        end
-
-        local filter = self._private.scaling_quality
-
-        if filter then
-            cr:get_source():set_filter(cairo.Filter[filter:upper()])
-        end
-
+    if not self._private.image then return end
+    local pol = policies_to_extents[policy.w] or policies_to_extents[policy.h]
+    if pol then
+        local pat = skia.Pattern.create_for_surface(self._private.image)
+        pat:set_extend(pol)
+        cr:set_source(pat)
         cr:paint()
+    else
+        cr:draw_image(self._private.image, 0, 0)
     end
 end
 
@@ -407,63 +272,35 @@ end
 -- @usage my_imagebox:set_image('/usr/share/icons/theme/my_icon.png')
 -- @see image
 function imagebox:set_image(image)
-    local setup_succeed
-
     -- Keep the original to prevent the cache from being GCed.
     self._private.original_image = image
 
-    if skia and type(image) == "string" then
-        local width, height = skia.image_dimensions(image)
-        if not width then return false end
-        self._private.default = { width = width, height = height }
-        self._private.handle = nil
-        self._private.image = image
-        setup_succeed = true
-    elseif skia and skia.is_image(image) then
-        -- An offscreen-rendered image (e.g. beautiful.awesome_icon), not
-        -- backed by a file, so dimensions come from the image object itself.
-        self._private.default = { width = image.width, height = image.height }
-        self._private.handle = nil
-        self._private.image = image
-        setup_succeed = true
-    elseif skia and not image then
-        setup_succeed = true
-        self._private.handle = nil
-        self._private.image = nil
-        self._private.default = nil
-    end
-
-    if not skia and type(image) == "userdata" and not (Rsvg and Rsvg.Handle:is_type_of(image)) then
-        -- This function is not documented to handle userdata objects, but
-        -- historically it did, and it did by just assuming they refer to a
-        -- cairo surface.
-        image = surface.load(image)
-    end
-
-    if not setup_succeed and type(image) == "string" then
-        -- try to load rsvg handle from file
-        setup_succeed = load_and_apply(self, image, imagebox._load_rsvg_handle, set_handle)
-
-        if not setup_succeed then
-            -- rsvg handle failed, try to load cairo surface with pixbuf
-            setup_succeed = load_and_apply(self, image, surface.load, set_surface)
+    if type(image) == "string" then
+        local loaded
+        if image:lower():match("%.svg$") then
+            local width, height = skia.svg_dimensions(image)
+            if width and height then
+                loaded = skia.load_svg(image, math.ceil(width), math.ceil(height),
+                    self._private.stylesheet)
+            end
+        else
+            loaded = surface.load_silently(image)
         end
-    elseif not setup_succeed and Rsvg and Rsvg.Handle:is_type_of(image) then
-        -- try to apply given rsvg handle
-        rsvg_handle_cache[image] = rsvg_handle_cache[image] or {}
-        setup_succeed = set_handle(self, image, rsvg_handle_cache[image])
-    elseif not setup_succeed and cairo.Surface:is_type_of(image) then
-        -- try to apply given cairo surface
-        setup_succeed = set_surface(self, image)
-    elseif not setup_succeed and not image then
-        -- nil as argument mean full imagebox reset
-        setup_succeed = true
+        if not loaded then return false end
+        self._private.default = { width = loaded:get_width(), height = loaded:get_height() }
+        self._private.handle = nil
+        self._private.image = loaded
+    elseif skia.Surface.is_type_of(image) or skia.is_image(image) then
+        self._private.default = { width = image:get_width(), height = image:get_height() }
+        self._private.handle = nil
+        self._private.image = image
+    elseif not image then
         self._private.handle = nil
         self._private.image = nil
         self._private.default = nil
+    else
+        return false
     end
-
-    if not setup_succeed then return false end
 
     self:emit_signal("widget::redraw_needed")
     self:emit_signal("widget::layout_changed")

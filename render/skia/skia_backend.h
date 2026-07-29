@@ -33,24 +33,6 @@ awesome_skia_renderer_t *awesome_skia_renderer_create(
     char *error,
     size_t error_size);
 
-/** Create a renderer that draws with Skia on the CPU and uploads the result
- * into an existing X drawable (a pixmap).
- *
- * Client titlebars share one frame window between several drawables, so they
- * cannot each own a Vulkan swapchain. They keep the pixmap Awesome already
- * blits to the frame window, and only the drawing moves to Skia. The returned
- * renderer is used exactly like a swapchain-backed one.
- */
-awesome_skia_renderer_t *awesome_skia_renderer_create_raster(
-    xcb_connection_t *connection,
-    xcb_drawable_t target,
-    xcb_gcontext_t gc,
-    uint8_t depth,
-    uint32_t width,
-    uint32_t height,
-    char *error,
-    size_t error_size);
-
 /** Destroy the renderer and all owned Vulkan/Skia resources. */
 void awesome_skia_renderer_destroy(awesome_skia_renderer_t *renderer);
 
@@ -120,6 +102,7 @@ class SkCanvas;
 /* Internal C++ hook for Awesome's Lua binding. It is intentionally outside the
  * C ABI above so C sources can never accidentally depend on Skia headers. */
 SkCanvas *awesome_skia_frame_canvas(awesome_skia_frame_t *frame);
+
 #endif
 
 #endif

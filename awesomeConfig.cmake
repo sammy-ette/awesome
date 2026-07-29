@@ -14,7 +14,6 @@ option(COMPRESS_MANPAGES "compress manpages" ON)
 option(GENERATE_DOC "generate API documentation" ON)
 option(DO_COVERAGE "build with coverage" OFF)
 autoOption(WITH_XCB_ERRORS "build with xcb-errors")
-option(WITH_SKIA_VULKAN "build Awesome with the Skia/Vulkan GPU renderer" OFF)
 if (GENERATE_DOC AND DO_COVERAGE)
     message(STATUS "Not generating API documentation with DO_COVERAGE")
     set(GENERATE_DOC OFF)
@@ -135,7 +134,6 @@ set(AWESOME_DEPENDENCIES
     glib-2.0
     glib-2.0>=2.79.2
     gdk-pixbuf-2.0
-    cairo
     x11
     xcb-cursor
     xcb-randr
@@ -156,7 +154,6 @@ set(AWESOME_DEPENDENCIES
     xcb-xkb
     xkbcommon
     xkbcommon-x11
-    cairo-xcb
     libstartup-notification-1.0
     libstartup-notification-1.0>=0.10
     xproto

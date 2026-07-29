@@ -14,8 +14,7 @@ local capi = {
 }
 local beautiful = require("beautiful")
 local base = require("wibox.widget.base")
-local skia = rawget(_G, "skia")
-local cairo = skia and nil or require("lgi").cairo
+local skia = require("skia")
 local color = require("gears.color")
 local object = require("gears.object")
 local surface = require("gears.surface")
@@ -31,7 +30,18 @@ local visible_drawables = {}
 local systray_widget
 local get_widget_context
 
-local function do_redraw_skia(self, renderer)
+local function do_redraw(self)
+    if not self.drawable.valid then return end
+    if self._forced_screen and not self._forced_screen.valid then return end
+
+    local renderer = self.drawable.skia_renderer
+    if not renderer then
+        -- A drawable with no area gets no renderer; there is nothing to draw.
+        local geom = self.drawable:geometry()
+        if geom.width == 0 or geom.height == 0 then return end
+        error("Skia/Vulkan could not create a drawable renderer")
+    end
+
     local cr = skia.begin(renderer)
     local geom = self.drawable:geometry()
     local x, y, width, height = geom.x, geom.y, geom.width, geom.height
@@ -114,117 +124,6 @@ get_widget_context = function(self)
         self._need_complete_repaint = true
     end
     return context
-end
-
-local function do_redraw(self)
-    if not self.drawable.valid then return end
-    if self._forced_screen and not self._forced_screen.valid then return end
-
-    if skia then
-        local renderer = self.drawable.skia_renderer
-        if not renderer then
-            error("Skia/Vulkan could not create a drawable renderer; refusing Cairo fallback")
-        end
-        return do_redraw_skia(self, renderer)
-    end
-
-    local surf = surface.load_silently(self.drawable.surface, false)
-    -- The surface can be nil if the drawable's parent was already finalized
-    if not surf then return end
-    local cr = cairo.Context(surf)
-    local geom = self.drawable:geometry();
-    local x, y, width, height = geom.x, geom.y, geom.width, geom.height
-    local context = get_widget_context(self)
-
-    -- Relayout
-    if self._need_relayout or self._need_complete_repaint then
-        self._need_relayout = false
-        if self._widget_hierarchy and self._widget then
-            local had_systray = systray_widget and self._widget_hierarchy:get_count(systray_widget) > 0
-
-            self._widget_hierarchy:update(context,
-                self._widget, width, height, self._dirty_area)
-
-            local has_systray = systray_widget and self._widget_hierarchy:get_count(systray_widget) > 0
-            if had_systray and not has_systray then
-                systray_widget:_kickout(context)
-            end
-        else
-            self._need_complete_repaint = true
-            if self._widget then
-                self._widget_hierarchy_callback_arg = {}
-                self._widget_hierarchy = whierarchy.new(context, self._widget, width, height,
-                        self._redraw_callback, self._layout_callback, self._widget_hierarchy_callback_arg)
-            else
-                self._widget_hierarchy = nil
-            end
-        end
-
-        if self._need_complete_repaint then
-            self._need_complete_repaint = false
-            self._dirty_area:union_rectangle(cairo.RectangleInt{
-                x = 0, y = 0, width = width, height = height
-            })
-        end
-    end
-
-    -- Clip to the dirty area
-    if self._dirty_area:is_empty() then
-        return
-    end
-    for i = 0, self._dirty_area:num_rectangles() - 1 do
-        local rect = self._dirty_area:get_rectangle(i)
-        cr:rectangle(rect.x, rect.y, rect.width, rect.height)
-    end
-    self._dirty_area = cairo.Region.create()
-    cr:clip()
-
-    -- Draw the background
-    cr:save()
-
-    if not capi.awesome.composite_manager_running then
-        -- This is pseudo-transparency: We draw the wallpaper in the background
-        local wallpaper = surface.load_silently(capi.root.wallpaper(), false)
-        cr.operator = cairo.Operator.SOURCE
-        if wallpaper then
-            cr:set_source_surface(wallpaper, -x, -y)
-        else
-            cr:set_source_rgb(0, 0, 0)
-        end
-        cr:paint()
-        cr.operator = cairo.Operator.OVER
-    else
-        -- This is true transparency: We draw a translucent background
-        cr.operator = cairo.Operator.SOURCE
-    end
-
-    cr:set_source(self.background_color)
-    cr:paint()
-
-    cr:restore()
-
-    -- Paint the background image
-    if self.background_image then
-        cr:save()
-        if type(self.background_image) == "function" then
-            self.background_image(context, cr, width, height, unpack(self.background_image_args))
-        else
-            local pattern = cairo.Pattern.create_for_surface(self.background_image)
-            cr:set_source(pattern)
-            cr:paint()
-        end
-        cr:restore()
-    end
-
-    -- Draw the widget
-    if self._widget_hierarchy then
-        cr:set_source(self.foreground_color)
-        self._widget_hierarchy:draw(context, cr)
-    end
-
-    self.drawable:refresh()
-
-    assert(cr.status == "SUCCESS", "Cairo context entered error state: " .. cr.status)
 end
 
 local function find_widgets(self, result, hierarchy, x, y)
@@ -339,15 +238,11 @@ end
 -- @param image A background image or a function
 function drawable:set_bgimage(image, ...)
     if image ~= nil and type(image) ~= "function" then
-        if skia then
-            -- gears.surface resolves a path or an existing skia.image; wrap
-            -- the result in a draw callback so it flows through the same
-            -- handling as a procedurally-drawn background.
-            local resolved = surface.load(image)
-            image = resolved and function(_, cr) cr:draw_image(resolved, 0, 0) end or nil
-        else
-            image = surface(image)
-        end
+        -- gears.surface resolves a path or an existing surface; wrap the
+        -- result in a draw callback so it flows through the same handling
+        -- as a procedurally-drawn background.
+        local resolved = surface.load(image)
+        image = resolved and function(_, cr) cr:draw_image(resolved, 0, 0) end or nil
     end
 
     self.background_image = image
@@ -452,7 +347,7 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     ret._widget_context_skeleton = widget_context_skeleton
     ret._need_complete_repaint = true
     ret._need_relayout = true
-    ret._dirty_area = skia and region.new() or cairo.Region.create()
+    ret._dirty_area = region.new()
     setup_signals(ret)
 
     for k, v in pairs(drawable) do
@@ -529,7 +424,7 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
         local x, y, width, height = matrix.transform_rectangle(m, hierar:get_draw_extents())
         local x1, y1 = math.floor(x), math.floor(y)
         local x2, y2 = math.ceil(x + width), math.ceil(y + height)
-        ret._dirty_area:union_rectangle(cairo.RectangleInt{
+        ret._dirty_area:union_rectangle({
             x = x1, y = y1, width = x2 - x1, height = y2 - y1
         })
         ret:draw()

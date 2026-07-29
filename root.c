@@ -42,117 +42,28 @@
 #include "objects/button.h"
 #include "common/luaclass.h"
 #include "xwindow.h"
+#include "draw.h"
 
 #include "math.h"
 
 #include <xcb/xtest.h>
 #include <xcb/xcb_aux.h>
-#include <cairo-xcb.h>
+#include <string.h>
 
 static int miss_index_handler    = LUA_REFNIL;
 static int miss_newindex_handler = LUA_REFNIL;
 static int miss_call_handler     = LUA_REFNIL;
 
-static void
-root_set_wallpaper_pixmap(xcb_connection_t *c, xcb_pixmap_t p)
-{
-    xcb_get_property_cookie_t prop_c;
-    xcb_get_property_reply_t *prop_r;
-    const xcb_screen_t *screen = globalconf.screen;
-
-    /* We now have the pattern painted to the pixmap p. Now turn p into the root
-     * window's background pixmap.
-     */
-    xcb_change_window_attributes(c, screen->root, XCB_CW_BACK_PIXMAP, &p);
-    xcb_clear_area(c, 0, screen->root, 0, 0, 0, 0);
-
-    prop_c = xcb_get_property_unchecked(c, false,
-            screen->root, ESETROOT_PMAP_ID, XCB_ATOM_PIXMAP, 0, 1);
-
-    /* Theoretically, this should be enough to set the wallpaper. However, to
-     * make pseudo-transparency work, clients need a way to get the wallpaper.
-     * You can't query a window's back pixmap, so properties are (ab)used.
-     */
-    xcb_change_property(c, XCB_PROP_MODE_REPLACE, screen->root, _XROOTPMAP_ID, XCB_ATOM_PIXMAP, 32, 1, &p);
-    xcb_change_property(c, XCB_PROP_MODE_REPLACE, screen->root, ESETROOT_PMAP_ID, XCB_ATOM_PIXMAP, 32, 1, &p);
-
-    /* Now make sure that the old wallpaper is freed (but only do this for ESETROOT_PMAP_ID) */
-    prop_r = xcb_get_property_reply(c, prop_c, NULL);
-    if (prop_r && prop_r->value_len)
-    {
-        xcb_pixmap_t *rootpix = xcb_get_property_value(prop_r);
-        if (rootpix)
-            xcb_kill_client(c, *rootpix);
-    }
-    p_delete(&prop_r);
-}
-
 static bool
-root_set_wallpaper(cairo_pattern_t *pattern)
+root_set_wallpaper(lua_State *L, int index)
 {
-    lua_State *L = globalconf_get_lua_State();
-    xcb_connection_t *c = xcb_connect(NULL, NULL);
-    xcb_pixmap_t p = xcb_generate_id(c);
-    /* globalconf.connection should be connected to the same X11 server, so we
-     * can just use the info from that other connection.
-     */
-    const xcb_screen_t *screen = globalconf.screen;
-    uint16_t width = screen->width_in_pixels;
-    uint16_t height = screen->height_in_pixels;
-    bool result = false;
-    cairo_surface_t *surface;
-    cairo_t *cr;
-
-    if (xcb_connection_has_error(c))
-        goto disconnect;
-
-    /* Create a pixmap and make sure it is already created, because we are going
-     * to use it from the other X11 connection (Juggling with X11 connections
-     * is a really, really bad idea).
-     */
-    xcb_create_pixmap(c, screen->root_depth, p, screen->root, width, height);
-    xcb_aux_sync(c);
-
-    /* Now paint to the picture from the main connection so that cairo sees that
-     * it can tell the X server to copy between the (possible) old pixmap and
-     * the new one directly and doesn't need GetImage and PutImage.
-     */
-    surface = cairo_xcb_surface_create(globalconf.connection, p, draw_default_visual(screen), width, height);
-    cr = cairo_create(surface);
-    /* Paint the pattern to the surface */
-    cairo_set_source(cr, pattern);
-    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_paint(cr);
-    cairo_destroy(cr);
-    cairo_surface_flush(surface);
-    xcb_aux_sync(globalconf.connection);
-
-    /* Change the wallpaper, without sending us a PropertyNotify event */
-    xcb_grab_server(globalconf.connection);
-    xcb_change_window_attributes(globalconf.connection,
-                                 globalconf.screen->root,
-                                 XCB_CW_EVENT_MASK,
-                                 (uint32_t[]) { 0 });
-    root_set_wallpaper_pixmap(globalconf.connection, p);
-    xcb_change_window_attributes(globalconf.connection,
-                                 globalconf.screen->root,
-                                 XCB_CW_EVENT_MASK,
-                                 ROOT_WINDOW_EVENT_MASK);
-    xutil_ungrab_server(globalconf.connection);
-
-    /* Make sure our pixmap is not destroyed when we disconnect. */
-    xcb_set_close_down_mode(c, XCB_CLOSE_DOWN_RETAIN_PERMANENT);
-
-    /* Tell Lua that the wallpaper changed */
-    cairo_surface_destroy(globalconf.wallpaper);
-    globalconf.wallpaper = surface;
+    awesome_skia_image_t *image = awesome_skia_image_from_lua(L, index);
+    if (!image)
+        return false;
+    awesome_skia_image_unref(globalconf.wallpaper);
+    globalconf.wallpaper = image;
     signal_object_emit(L, &global_signals, "wallpaper_changed", 0);
-
-    result = true;
-disconnect:
-    xcb_aux_sync(c);
-    xcb_disconnect(c);
-    return result;
+    return true;
 }
 
 void
@@ -164,7 +75,7 @@ root_update_wallpaper(void)
     xcb_get_geometry_reply_t *geom_r;
     xcb_pixmap_t *rootpix;
 
-    cairo_surface_destroy(globalconf.wallpaper);
+    awesome_skia_image_unref(globalconf.wallpaper);
     globalconf.wallpaper = NULL;
 
     prop_c = xcb_get_property_unchecked(globalconf.connection, false,
@@ -197,11 +108,27 @@ root_update_wallpaper(void)
         warn("Got a pixmap with depth %d, but the default depth is %d, continuing anyway",
                 geom_r->depth, draw_visual_depth(globalconf.screen, globalconf.default_visual->visual_id));
 
-    globalconf.wallpaper = cairo_xcb_surface_create(globalconf.connection,
-                                                    *rootpix,
-                                                    globalconf.default_visual,
-                                                    geom_r->width,
-                                                    geom_r->height);
+    xcb_get_image_reply_t *image_reply = xcb_get_image_reply(globalconf.connection,
+        xcb_get_image_unchecked(globalconf.connection, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                                *rootpix, 0, 0, geom_r->width, geom_r->height,
+                                UINT32_MAX), NULL);
+    if (image_reply) {
+        const int width = geom_r->width, height = geom_r->height;
+        const int stride = height ? xcb_get_image_data_length(image_reply) / height : 0;
+        if (stride >= width * 4) {
+            uint32_t *pixels = p_new(uint32_t, (size_t) width * height);
+            const uint8_t *data = xcb_get_image_data(image_reply);
+            for (int y = 0; y < height; y++)
+                for (int x = 0; x < width; x++) {
+                    uint32_t pixel;
+                    memcpy(&pixel, data + y * stride + x * 4, sizeof(pixel));
+                    pixels[y * width + x] = pixel | 0xff000000u;
+                }
+            globalconf.wallpaper = draw_image_from_data(width, height, pixels);
+            p_delete(&pixels);
+        }
+        p_delete(&image_reply);
+    }
 
     p_delete(&prop_r);
     p_delete(&geom_r);
@@ -483,10 +410,10 @@ luaA_root_drawins(lua_State *L)
     return 1;
 }
 
-/** Get the wallpaper as a cairo surface or set it as a cairo pattern.
+/** Get the cached wallpaper as a Skia image or set it from a Skia image/surface.
  *
- * @param pattern A cairo pattern as light userdata
- * @return A cairo surface or nothing.
+ * @param image A Skia image or surface.
+ * @return A Skia image or nothing.
  * @deprecated wallpaper
  * @see awful.wallpaper
  */
@@ -500,8 +427,7 @@ luaA_root_wallpaper(lua_State *L)
         if(lua_isnil(L, -1))
             return 0;
 
-        cairo_pattern_t *pattern = (cairo_pattern_t *)lua_touserdata(L, -1);
-        lua_pushboolean(L, root_set_wallpaper(pattern));
+        lua_pushboolean(L, root_set_wallpaper(L, -1));
         /* Don't return the wallpaper, it's too easy to get memleaks */
         return 1;
     }
@@ -509,32 +435,50 @@ luaA_root_wallpaper(lua_State *L)
     if(globalconf.wallpaper == NULL)
         return 0;
 
-    /* lua has to make sure this surface gets destroyed */
-    lua_pushlightuserdata(L, cairo_surface_reference(globalconf.wallpaper));
+    awesome_skia_image_push_lua(L, globalconf.wallpaper);
     return 1;
 }
 
 
-/** Get the content of the root window as a cairo surface.
+/** Get a Skia image snapshot of the root window.
  *
  * @property content
- * @tparam raw_surface content A cairo surface with the root window content (aka the whole surface from every screens).
- * @propertydefault This is the live content. Use `gears.surface(root.content)` to
- *  take a screenshot.
+ * @tparam skia.Image content A snapshot of the root window content.
  * @see gears.surface
  */
 static int
 luaA_root_get_content(lua_State *L)
 {
-    cairo_surface_t *surface;
-
-    surface = cairo_xcb_surface_create(globalconf.connection,
-                                       globalconf.screen->root,
-                                       globalconf.default_visual,
-                                       globalconf.screen->width_in_pixels,
-                                       globalconf.screen->height_in_pixels);
-
-    lua_pushlightuserdata(L, surface);
+    const int width = globalconf.screen->width_in_pixels;
+    const int height = globalconf.screen->height_in_pixels;
+    xcb_get_image_reply_t *reply = xcb_get_image_reply(globalconf.connection,
+        xcb_get_image_unchecked(globalconf.connection, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                                globalconf.screen->root, 0, 0, width, height,
+                                UINT32_MAX), NULL);
+    if (!reply) {
+        lua_pushnil(L);
+        return 1;
+    }
+    const int length = xcb_get_image_data_length(reply);
+    const int stride = height > 0 ? length / height : 0;
+    if (stride < width * 4) {
+        p_delete(&reply);
+        lua_pushnil(L);
+        return 1;
+    }
+    uint32_t *pixels = p_new(uint32_t, (size_t) width * height);
+    const uint8_t *data = xcb_get_image_data(reply);
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) {
+            uint32_t pixel;
+            memcpy(&pixel, data + y * stride + x * 4, sizeof(pixel));
+            pixels[y * width + x] = pixel | 0xff000000u;
+        }
+    awesome_skia_image_t *image = draw_image_from_data(width, height, pixels);
+    p_delete(&pixels);
+    p_delete(&reply);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 

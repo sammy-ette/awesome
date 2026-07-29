@@ -6,7 +6,6 @@
 -- @classmod gears.matrix
 ---------------------------------------------------------------------------
 
-local cairo
 local matrix = {}
 
 -- Metatable for matrix instances. This is set up near the end of the file.
@@ -65,6 +64,21 @@ function matrix.create_rotate_at(x, y, angle)
     return   matrix.create_translate( -x, -y )
            * matrix.create_rotate   ( angle  )
            * matrix.create_translate(  x,  y )
+end
+
+--- Convert a Skia affine-matrix table to a gears matrix.
+-- Skia contexts and the Lua bridge use the same xx/yx/xy/yy/x0/y0 fields, so
+-- this intentionally accepts plain tables as well as future native matrices.
+function matrix.from_skia_matrix(value)
+    return matrix.create(value.xx, value.yx, value.xy, value.yy, value.x0, value.y0)
+end
+
+--- Convert this matrix to the affine-table form accepted by Skia contexts.
+function matrix:to_skia_matrix()
+    return {
+        xx = self.xx, yx = self.yx, xy = self.xy,
+        yy = self.yy, x0 = self.x0, y0 = self.y0,
+    }
 end
 
 --- Translate this matrix
@@ -193,36 +207,6 @@ function matrix:transform_rectangle(x, y, width, height)
     height = math.max(y1, y2, y3, y4) - y
 
     return x, y, width, height
-end
-
---- Convert to a cairo matrix
--- @treturn cairo.Matrix A cairo matrix describing the same transformation.
-function matrix:to_cairo_matrix()
-    cairo = cairo or require("lgi").cairo
-    local ret = cairo.Matrix()
-    ret:init(self.xx, self.yx, self.xy, self.yy, self.x0, self.y0)
-    return ret
-end
-
---- Convert to a cairo matrix
--- @tparam cairo.Matrix mat A cairo matrix describing the sought transformation
--- @treturn gears.matrix A matrix instance describing the same transformation.
-function matrix.from_cairo_matrix(mat)
-    return matrix.create(mat.xx, mat.yx, mat.xy, mat.yy, mat.x0, mat.y0)
-end
-
---- Convert to the matrix type the active renderer's canvas accepts.
---
--- Under Skia this is the `gears.matrix` itself: a Skia canvas reads the same
--- `xx`/`yx`/`xy`/`yy`/`x0`/`y0` fields directly, so no conversion happens.
--- Under Cairo it is the equivalent `cairo.Matrix`.
---
--- @treturn gears.matrix|cairo.Matrix A matrix the canvas `:transform()` accepts.
-function matrix:to_native()
-    if rawget(_G, "skia") then
-        return self
-    end
-    return self:to_cairo_matrix()
 end
 
 matrix_mt.__index = matrix

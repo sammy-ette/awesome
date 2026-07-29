@@ -25,12 +25,13 @@
 #include "objects/drawin.h"
 #include "xwindow.h"
 #include "globalconf.h"
+#include "draw.h"
 
 #include <xcb/xcb.h>
 #include <xcb/xcb_icccm.h>
 #include <xcb/xcb_atom.h>
 #include <xcb/damage.h>
-#include <cairo-xcb.h>
+#include <string.h>
 
 #define SYSTEM_TRAY_REQUEST_DOCK 0 /* Begin icon docking */
 
@@ -457,7 +458,7 @@ luaA_systray(lua_State *L)
     return 2;
 }
 
-/** Return the native surface of the systray if composite is enabled.
+/** Return a Skia image snapshot of the systray if composite is enabled.
  * \param L The Lua VM state.
  * \return the number of element returned. (1)
   * \luastack
@@ -474,11 +475,36 @@ luaA_systray_surface(lua_State *L)
 
     int width = luaL_checkinteger(L, 1);
     int height = luaL_checkinteger(L, 2);
-    /* Lua has to make sure to free the ref or we have a leak */
-    lua_pushlightuserdata(
-        L, cairo_xcb_surface_create(
-            globalconf.connection, globalconf.systray.window, globalconf.visual,
-            width, height));
+    xcb_get_image_reply_t *reply = xcb_get_image_reply(globalconf.connection,
+        xcb_get_image_unchecked(globalconf.connection, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                                globalconf.systray.window, 0, 0, width, height,
+                                UINT32_MAX), NULL);
+    if (!reply) {
+        lua_pushnil(L);
+        return 1;
+    }
+    const int length = xcb_get_image_data_length(reply);
+    const int stride = height > 0 ? length / height : 0;
+    if (stride < width * 4) {
+        p_delete(&reply);
+        lua_pushnil(L);
+        return 1;
+    }
+    uint32_t *pixels = p_new(uint32_t, (size_t) width * height);
+    const uint8_t *data = xcb_get_image_data(reply);
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++) {
+            uint32_t pixel;
+            memcpy(&pixel, data + y * stride + x * 4, sizeof(pixel));
+            /* Systray's XRGB visual has no alpha byte; its contents are
+             * opaque unless an embedded client supplied a composited alpha. */
+            pixels[y * width + x] = pixel | 0xff000000u;
+        }
+    awesome_skia_image_t *image = draw_image_from_data(width, height, pixels);
+    p_delete(&pixels);
+    p_delete(&reply);
+    awesome_skia_image_push_lua(L, image);
+    awesome_skia_image_unref(image);
     return 1;
 }
 

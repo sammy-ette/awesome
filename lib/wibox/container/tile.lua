@@ -10,86 +10,15 @@
 -- @containermod wibox.container.tile
 -- @supermodule wibox.container.place
 local place = require("wibox.container.place")
-local skia = rawget(_G, "skia")
-local cairo = skia and nil or require("lgi").cairo
-local widget = skia and nil or require("wibox.widget")
 local base = require("wibox.widget.base")
 local gtable = require("gears.table")
 
 local module = {mt = {}}
 
 function module:draw(context, cr, width, height)
-    -- Skia keeps each repeated child in the hierarchy.  Rendering them as
-    -- layouts avoids the legacy Cairo image-surface/pattern cache entirely.
-    if skia and skia.is_canvas(cr) then return end
-    if not self._private.tiled then return end
-    if not self._private.widget then return end
-
-    local x, y, w, h = self:_layout(context, width, height)
-
-    local vspace, hspace = self.vertical_spacing, self.horizontal_spacing
-    local vcrop, hcrop = self.vertical_crop, self.horizontal_crop
-
-    -- In theory we could avoid a few repaints by tracking the child widget
-    -- redraw independently from the container redraw. However it is nearly a
-    -- 1:1 march, so there's little reasons to do it.
-    if not self._private.surface then
-        self._private.surface = cairo.ImageSurface(cairo.Format.ARGB32, w+hspace, h+vspace)
-        self._private.cr = cairo.Context(self._private.surface)
-        self._private.cr:set_source(cr:get_source())
-        self._private.pattern = cairo.Pattern.create_for_surface(self._private.surface)
-        self._private.pattern.extend = cairo.Extend.REPEAT
-        self._private.cr:translate(math.ceil(hspace), math.ceil(vspace))
-    else
-        self._private.cr:set_operator(cairo.Operator.CLEAR)
-        self._private.cr:set_source_rgba(0,0,0,1)
-        self._private.cr:paint()
-        self._private.cr:set_operator(cairo.Operator.SOURCE)
-    end
-
-    widget.draw_to_cairo_context(self._private.widget, self._private.cr, w, h, context)
-
-    cr:save()
-
-    -- We do our own clip.
-    cr:reset_clip()
-
-    local x0, y0 = 0, 0
-
-    -- Avoid painting incomplete tiles
-    if hcrop and x ~= 0 then
-        x0 = x - math.floor(x/(w+hspace))*(w+hspace)
-    end
-
-    if hcrop then
-        width = x + w + hspace + math.floor((width - (x + w + hspace))/(w+hspace))*(w+hspace)
-    end
-
-    if vcrop and y ~= 0 then
-        y0 = y - math.floor(y/(h+vspace))*(h+vspace)
-    end
-
-    if vcrop then
-        height = (y+h+vspace) + math.floor((height - (y+h+vspace))/(h+vspace))*(h+vspace)
-    end
-
-    -- Create a clip around the "real" widget in case there is some transparency.
-    cr:rectangle(x0, y0, width-x0, y-y0)
-    cr:rectangle(x0, y0, x-hspace-x0, height-y0)
-    cr:rectangle(x+hspace+w, y0, width - (x+w+hspace), height-y0)
-    cr:rectangle(x, y+vspace+h, w+hspace, height - (y+h+vspace))
-    cr:clip()
-
-    -- Make sure the tiles are aligned with the child widget.
-    cr:translate(x - hspace, y - vspace)
-
-
-    -- Use OVER rather than SOURCE to preserve the alpha.
-    cr.operator = cairo.Operator.OVER
-    cr.source = self._private.pattern
-    cr:paint()
-
-    cr:restore()
+    -- Repetition is represented in layout(), so rendering needs no temporary
+    -- raster surface or pattern cache.
+    return
 end
 
 -- A Cairo pattern repeats a CPU-rasterized child.  The GPU equivalent is to
@@ -97,7 +26,7 @@ end
 -- decoding on the Skia path.  This also preserves ordinary widget semantics:
 -- every copy is laid out and clipped by the normal hierarchy.
 function module:layout(context, width, height)
-    if not skia or not self._private.tiled then
+    if not self._private.tiled then
         return place.layout(self, context, width, height)
     end
     if not self._private.widget then return end
@@ -192,7 +121,7 @@ for prop in pairs(defaults) do
 
     module["set_"..prop] = function(self, value)
         self._private[prop] = value
-        self:emit_signal(skia and "widget::layout_changed" or "widget::redraw_needed", value)
+        self:emit_signal("widget::layout_changed", value)
     end
 
     module["get_"..prop] = function(self)

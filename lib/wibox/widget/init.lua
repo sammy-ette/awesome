@@ -6,7 +6,7 @@
 -- @module wibox.widget
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local skia = require("skia")
 local hierarchy = require("wibox.hierarchy")
 local gcolor = require("gears.color")
 local beautiful = nil
@@ -33,17 +33,17 @@ setmetatable(widget, {
     end
 })
 
---- Draw a widget directly to a given cairo context.
+--- Draw a widget directly to a Skia context.
 -- This function creates a temporary `wibox.hierarchy` instance and uses that to
--- draw the given widget once to the given cairo context.
+-- draw the given widget once to the given Skia context.
 -- @tparam widget wdg A widget to draw
--- @tparam cairo_context cr The cairo context to draw the widget on
+-- @tparam skia_context cr The Skia context to draw the widget on
 -- @tparam number width The width of the widget
 -- @tparam number height The height of the widget
 -- @tparam[opt={dpi=96}] table context The context information to give to the widget.
 -- @noreturn
--- @staticfct wibox.widget.draw_to_cairo_context
-function widget.draw_to_cairo_context(wdg, cr, width, height, context)
+-- @staticfct wibox.widget.draw_to_context
+function widget.draw_to_context(wdg, cr, width, height, context)
     local function no_op() end
     context = context or {dpi=96}
     local h = hierarchy.new(context, wdg, width, height, no_op, no_op, {})
@@ -59,32 +59,32 @@ end
 -- @noreturn
 -- @staticfct wibox.widget.draw_to_svg_file
 function widget.draw_to_svg_file(wdg, path, width, height, context)
-    local img = cairo.SvgSurface.create(path, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.SvgSurface.create(path, width, height)
+    local cr = skia.Context(img)
 
     beautiful = beautiful or require("beautiful")
     cr:set_source(gcolor(beautiful.fg_normal))
 
-    widget.draw_to_cairo_context(wdg, cr, width, height, context)
+    widget.draw_to_context(wdg, cr, width, height, context)
     img:finish()
 end
 
---- Create a cairo image surface showing this widget.
+--- Create a Skia image surface showing this widget.
 -- @tparam widget wdg A widget
 -- @tparam number width The surface width
 -- @tparam number height The surface height
--- @param[opt=cairo.Format.ARGB32] format The surface format
+-- @param[opt=skia.Format.ARGB32] format The surface format
 -- @tparam[opt={dpi=96}] table context The context information to give to the widget.
--- @return The cairo surface
+-- @return The Skia surface
 -- @staticfct wibox.widget.draw_to_image_surface
 function widget.draw_to_image_surface(wdg, width, height, format, context)
-    local img = cairo.ImageSurface(format or cairo.Format.ARGB32, width, height)
-    local cr = cairo.Context(img)
+    local img = skia.ImageSurface(format or skia.Format.ARGB32, width, height)
+    local cr = skia.Context(img)
 
     beautiful = beautiful or require("beautiful")
     cr:set_source(gcolor(beautiful.fg_normal))
 
-    widget.draw_to_cairo_context(wdg, cr, width, height, context)
+    widget.draw_to_context(wdg, cr, width, height, context)
     return img
 end
 

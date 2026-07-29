@@ -9,22 +9,17 @@
 ---------------------------------------------------------------------------
 
 local matrix = require("gears.matrix")
+local skia = require("skia")
 local protected_call = require("gears.protected_call")
-local skia = rawget(_G, "skia")
-local cairo = skia and nil or require("lgi").cairo
 local region_module = require("gears.region")
 local base = require("wibox.widget.base")
 local no_parent = base.no_parent_I_know_what_I_am_doing
 
 local hierarchy = {}
 
--- Cairo regions use a GI boxed RectangleInt. The Skia path keeps dirty regions
--- as plain geometry, so it deliberately has no Cairo object dependency.
+-- gears.region tracks dirty rectangles as plain geometry tables.
 local function rectangle_int(x, y, width, height)
-    if skia then
-        return { x = x, y = y, width = width, height = height }
-    end
-    return cairo.RectangleInt { x = x, y = y, width = width, height = height }
+    return { x = x, y = y, width = width, height = height }
 end
 
 local widgets_to_count = setmetatable({}, { __mode = "k" })
@@ -229,11 +224,11 @@ end
 -- @param width The available width for this hierarchy.
 -- @param height The available height for this hierarchy.
 -- @param[opt] region A region to use for accumulating changed parts
--- @return A cairo region describing the changed parts (either the `region`
+-- @return A Skia region describing the changed parts (either the `region`
 --   argument or a new, internally created region).
 -- @method update
 function hierarchy:update(context, widget, width, height, region)
-    region = region or (rawget(_G, "skia") and region_module.new() or cairo.Region.create())
+    region = region or region_module.new()
     hierarchy_update(self, context, widget, width, height, region, self._matrix, self._matrix_to_device)
     return region
 end
@@ -335,7 +330,7 @@ function hierarchy:draw(context, cr)
     end
 
     cr:save()
-    cr:transform(self:get_matrix_to_parent():to_native())
+    cr:transform(self:get_matrix_to_parent())
 
     -- Clip to the draw extents
     local ext_x, ext_y, ext_width, ext_height = self:get_draw_extents()
@@ -382,7 +377,7 @@ function hierarchy:draw(context, cr)
         -- Apply opacity
         if opacity ~= 1 and cr.pop_group_to_source then
             cr:pop_group_to_source()
-            cr.operator = cairo.Operator.OVER
+            cr:set_operator(skia.Operator.OVER)
             cr:paint_with_alpha(opacity)
         end
     end
