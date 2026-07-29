@@ -38,7 +38,6 @@ extern "C" {
 #include "include/core/SkTextBlob.h"
 #include "include/ports/SkFontMgr_fontconfig.h"
 #include "include/ports/SkFontScanner_FreeType.h"
-#include "modules/skshaper/include/SkShaper.h"
 
 #ifdef AWESOME_SKIA_HAS_SVG
 #include "modules/svg/include/SkSVGDOM.h"
@@ -1318,17 +1317,38 @@ void configure_sk_font_from_pango(SkFont *sk_font, PangoFont *font)
         sk_font->setForceAutoHinting(auto_hint == FcTrue);
 }
 
-SkShaper *text_shaper()
+SkPaint paint_for_pango_run(const lua_skia_frame *frame, const PangoGlyphItem *run)
 {
-    /* This is Skia's HarfBuzz shaper, which is already linked for SVG text.
-     * The individual Pango runs already provide fallback, so do not ask Skia
-     * to substitute a second font manager behind Pango's back. */
-    static std::unique_ptr<SkShaper> shaper = SkShaper::Make();
-    return shaper.get();
+    SkPaint paint = frame->state.paint;
+    uint8_t red = SkColorGetR(paint.getColor());
+    uint8_t green = SkColorGetG(paint.getColor());
+    uint8_t blue = SkColorGetB(paint.getColor());
+    uint8_t alpha = SkColorGetA(paint.getColor());
+
+    for (GSList *node = run->item->analysis.extra_attrs; node; node = node->next)
+    {
+        auto *attribute = static_cast<PangoAttribute *>(node->data);
+        if (!attribute || !attribute->klass)
+            continue;
+        if (attribute->klass->type == PANGO_ATTR_FOREGROUND)
+        {
+            const auto *color = reinterpret_cast<const PangoAttrColor *>(attribute);
+            red = color->color.red >> 8;
+            green = color->color.green >> 8;
+            blue = color->color.blue >> 8;
+        }
+        else if (attribute->klass->type == PANGO_ATTR_FOREGROUND_ALPHA)
+        {
+            const auto *opacity = reinterpret_cast<const PangoAttrInt *>(attribute);
+            alpha = CLAMP(opacity->value, 0, 65535) >> 8;
+        }
+    }
+    paint.setColor(SkColorSetARGB(alpha, red, green, blue));
+    return paint;
 }
 
 void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
-                          float origin_x, float baseline_y)
+                          float origin_x, float baseline_y, const SkPaint &paint)
 {
     PangoFont *font = run->item->analysis.font;
     sk_sp<SkTypeface> typeface = typeface_for_pango_font(font);
@@ -1371,56 +1391,17 @@ void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
     }
 
     if (emitted > 0)
-        canvas(frame)->drawTextBlob(builder.make(), 0, 0, frame->state.paint);
+        canvas(frame)->drawTextBlob(builder.make(), 0, 0, paint);
 }
 
 void draw_pango_run(lua_skia_frame *frame, PangoGlyphItem *run,
-                    const char *layout_text, size_t layout_bytes,
                     float origin_x, float baseline_y)
 {
-    /* Pango synthesizes ellipsis glyphs which have no corresponding slice in
-     * the input string. Keep that one special, compatibility-only case on its
-     * supplied glyphs until the textbox moves entirely to SkParagraph. */
-    if ((run->item->analysis.flags & PANGO_ANALYSIS_FLAG_IS_ELLIPSIS) != 0)
-    {
-        draw_pango_glyph_run(frame, run, origin_x, baseline_y);
-        return;
-    }
-
-    PangoFont *font = run->item->analysis.font;
-    sk_sp<SkTypeface> typeface = typeface_for_pango_font(font);
-    const float size = pango_font_pixel_size(font);
-    if (!typeface || size <= 0 || !layout_text || run->item->offset < 0 ||
-        run->item->length <= 0)
-        return;
-
-    const size_t text_offset = static_cast<size_t>(run->item->offset);
-    const size_t text_length = static_cast<size_t>(run->item->length);
-    if (text_offset > layout_bytes || text_length > layout_bytes - text_offset)
-        return;
-
-    SkShaper *shaper = text_shaper();
-    if (!shaper)
-    {
-        draw_pango_glyph_run(frame, run, origin_x, baseline_y);
-        return;
-    }
-
-    SkFont sk_font(typeface, size);
-    configure_sk_font_from_pango(&sk_font, font);
-
-    /* SkTextBlobBuilderRunHandler positions a line from its top. Pango gives
-     * us the baseline, so offset the final blob by Skia's ascent to preserve
-     * the original box and baseline contract. */
-    SkFontMetrics metrics;
-    sk_font.getMetrics(&metrics);
-    const char *text = layout_text + text_offset;
-    const bool left_to_right = (run->item->analysis.level & 1) == 0;
-    SkTextBlobBuilderRunHandler handler(text, SkPoint::Make(0, 0));
-    shaper->shape(text, text_length, sk_font, left_to_right, 999999.0f, &handler);
-    if (sk_sp<SkTextBlob> blob = handler.makeBlob())
-        canvas(frame)->drawTextBlob(blob, origin_x, baseline_y + metrics.fAscent,
-                                    frame->state.paint);
+    /* Pango has already shaped this exact run. Reusing its glyph IDs and
+     * positions preserves markup features, letter spacing, fallback, bidi,
+     * and alignment; Skia performs only the GPU rasterisation. */
+    draw_pango_glyph_run(frame, run, origin_x, baseline_y,
+                         paint_for_pango_run(frame, run));
 }
 
 /* frame:show_layout(layout_pointer, x, y) -- layout is an lgi PangoLayout's
@@ -1432,9 +1413,6 @@ int frame_show_layout(lua_State *L)
     auto *layout = static_cast<PangoLayout *>(lua_touserdata(L, 2));
     if (!layout || !PANGO_IS_LAYOUT(layout))
         return luaL_argerror(L, 2, "expected a PangoLayout pointer");
-
-    const char *layout_text = pango_layout_get_text(layout);
-    const size_t layout_bytes = layout_text ? std::strlen(layout_text) : 0;
 
     const float origin_x = static_cast<float>(luaL_optnumber(L, 3, 0));
     const float origin_y = static_cast<float>(luaL_optnumber(L, 4, 0));
@@ -1453,7 +1431,9 @@ int frame_show_layout(lua_State *L)
             static_cast<float>(pango_layout_iter_get_baseline(iter)) / PANGO_SCALE;
 
         PangoRectangle logical = {};
-        pango_layout_line_get_extents(line, nullptr, &logical);
+        /* The iterator extents include PangoLayout's center/right alignment;
+         * PangoLayoutLine's own extents are local to the line and start at 0. */
+        pango_layout_iter_get_line_extents(iter, nullptr, &logical);
         float pen = origin_x + static_cast<float>(logical.x) / PANGO_SCALE;
 
         for (GSList *item = line->runs; item; item = item->next)
@@ -1461,7 +1441,7 @@ int frame_show_layout(lua_State *L)
             auto *run = static_cast<PangoGlyphItem *>(item->data);
             if (!run)
                 continue;
-            draw_pango_run(frame, run, layout_text, layout_bytes, pen, baseline);
+            draw_pango_run(frame, run, pen, baseline);
             pen += static_cast<float>(pango_glyph_string_get_width(run->glyphs)) / PANGO_SCALE;
         }
     } while (pango_layout_iter_next_line(iter));
