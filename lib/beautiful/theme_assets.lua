@@ -21,6 +21,15 @@ local theme_assets = {}
 -- @return Image with the square.
 -- @staticfct beautiful.theme_assets.taglist_squares_sel
 function theme_assets.taglist_squares_sel(size, fg)
+    if rawget(_G, "skia") then
+        -- Keep theme assets on the drawin's GPU canvas: a Cairo ImageSurface
+        -- would turn this tiny decoration into a CPU bitmap upload.
+        return function(_, cr, width, height)
+            cr:set_source(gears_color(fg))
+            cr:rectangle(0, 0, width, height)
+            cr:fill()
+        end
+    end
     local img = cairo.ImageSurface(cairo.Format.ARGB32, size, size)
     local cr = cairo.Context(img)
     cr:set_source(gears_color(fg))
@@ -34,6 +43,14 @@ end
 -- @return Image with the square.
 -- @staticfct beautiful.theme_assets.taglist_squares_unsel
 function theme_assets.taglist_squares_unsel(size, fg)
+    if rawget(_G, "skia") then
+        return function(_, cr, width, height)
+            cr:set_source(gears_color(fg))
+            cr:set_line_width(size / 4)
+            cr:rectangle(0, 0, width, height)
+            cr:stroke()
+        end
+    end
     local img = cairo.ImageSurface(cairo.Format.ARGB32, size, size)
     local cr = cairo.Context(img)
     cr:set_source(gears_color(fg))
@@ -182,6 +199,14 @@ end
 -- @return Image with the logo.
 -- @staticfct beautiful.theme_assets.awesome_icon
 function theme_assets.awesome_icon(size, bg, fg)
+    local skia = rawget(_G, "skia")
+    if skia then
+        -- Render into an offscreen GPU-visible surface and hand back the
+        -- snapshotted image, so imagebox can draw it like any other image.
+        local cr = skia.new_image_surface(size, size)
+        theme_assets.gen_logo(cr, size, size, fg, bg)
+        return cr:snapshot()
+    end
     local img = cairo.ImageSurface(cairo.Format.ARGB32, size, size)
     local cr = cairo.Context(img)
     theme_assets.gen_logo(cr, size, size, fg, bg)

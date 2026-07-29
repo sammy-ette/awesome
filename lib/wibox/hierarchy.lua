@@ -10,11 +10,22 @@
 
 local matrix = require("gears.matrix")
 local protected_call = require("gears.protected_call")
-local cairo = require("lgi").cairo
+local skia = rawget(_G, "skia")
+local cairo = skia and nil or require("lgi").cairo
+local region_module = require("gears.region")
 local base = require("wibox.widget.base")
 local no_parent = base.no_parent_I_know_what_I_am_doing
 
 local hierarchy = {}
+
+-- Cairo regions use a GI boxed RectangleInt. The Skia path keeps dirty regions
+-- as plain geometry, so it deliberately has no Cairo object dependency.
+local function rectangle_int(x, y, width, height)
+    if skia then
+        return { x = x, y = y, width = width, height = height }
+    end
+    return cairo.RectangleInt { x = x, y = y, width = width, height = height }
+end
 
 local widgets_to_count = setmetatable({}, { __mode = "k" })
 
@@ -179,9 +190,7 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
         y = math.floor(y)
         w = math.ceil(w)
         h = math.ceil(h)
-        region:union_rectangle(cairo.RectangleInt{
-            x = x, y = y, width = w, height = h
-        })
+        region:union_rectangle(rectangle_int(x, y, w, h))
         child._parent = nil
     end
 
@@ -191,12 +200,8 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
     local new_width, new_height = math.ceil(x + w) - new_x, math.ceil(y + h) - new_y
     if new_x ~= old_x or new_y ~= old_y or new_width ~= old_width or new_height ~= old_height or
             widget ~= old_widget then
-        region:union_rectangle(cairo.RectangleInt{
-            x = old_x, y = old_y, width = old_width, height = old_height
-        })
-        region:union_rectangle(cairo.RectangleInt{
-            x = new_x, y = new_y, width = new_width, height = new_height
-        })
+        region:union_rectangle(rectangle_int(old_x, old_y, old_width, old_height))
+        region:union_rectangle(rectangle_int(new_x, new_y, new_width, new_height))
     end
 end
 
@@ -228,7 +233,7 @@ end
 --   argument or a new, internally created region).
 -- @method update
 function hierarchy:update(context, widget, width, height, region)
-    region = region or cairo.Region.create()
+    region = region or (rawget(_G, "skia") and region_module.new() or cairo.Region.create())
     hierarchy_update(self, context, widget, width, height, region, self._matrix, self._matrix_to_device)
     return region
 end
@@ -330,10 +335,15 @@ function hierarchy:draw(context, cr)
     end
 
     cr:save()
-    cr:transform(self:get_matrix_to_parent():to_cairo_matrix())
+    if skia and skia.is_canvas(cr) then
+        cr:transform_matrix(self:get_matrix_to_parent())
+    else
+        cr:transform(self:get_matrix_to_parent():to_cairo_matrix())
+    end
 
     -- Clip to the draw extents
-    cr:rectangle(self:get_draw_extents())
+    local ext_x, ext_y, ext_width, ext_height = self:get_draw_extents()
+    cr:rectangle(ext_x, ext_y, ext_width, ext_height)
     cr:clip()
 
     -- Draw if needed
@@ -349,7 +359,7 @@ function hierarchy:draw(context, cr)
         end
 
         -- Prepare opacity handling
-        if opacity ~= 1 then
+        if opacity ~= 1 and cr.push_group then
             cr:push_group()
         end
 
@@ -374,7 +384,7 @@ function hierarchy:draw(context, cr)
         cr:new_path()
 
         -- Apply opacity
-        if opacity ~= 1 then
+        if opacity ~= 1 and cr.pop_group_to_source then
             cr:pop_group_to_source()
             cr.operator = cairo.Operator.OVER
             cr:paint_with_alpha(opacity)

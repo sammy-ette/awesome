@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=awesome-skia
+Comment=Highly configurable framework window manager (Skia/Vulkan renderer)
+TryExec=@CMAKE_INSTALL_PREFIX@/bin/awesome
+Exec=@CMAKE_INSTALL_PREFIX@/bin/awesome
+Type=Application

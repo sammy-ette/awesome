@@ -3594,16 +3594,32 @@ titlebar_get_drawable(lua_State *L, client_t *c, int cl_idx, client_titlebar_t b
         cl_idx = luaA_absindex(L, cl_idx);
         switch (bar) {
         case CLIENT_TITLEBAR_TOP:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_top, c);
+            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_top, c
+#ifdef WITH_SKIA_VULKAN
+                               , XCB_NONE
+#endif
+                               );
             break;
         case CLIENT_TITLEBAR_BOTTOM:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_bottom, c);
+            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_bottom, c
+#ifdef WITH_SKIA_VULKAN
+                               , XCB_NONE
+#endif
+                               );
             break;
         case CLIENT_TITLEBAR_RIGHT:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_right, c);
+            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_right, c
+#ifdef WITH_SKIA_VULKAN
+                               , XCB_NONE
+#endif
+                               );
             break;
         case CLIENT_TITLEBAR_LEFT:
-            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_left, c);
+            drawable_allocator(L, (drawable_refresh_callback *) client_refresh_titlebar_left, c
+#ifdef WITH_SKIA_VULKAN
+                               , XCB_NONE
+#endif
+                               );
             break;
         default:
             fatal("Unknown titlebar kind %d\n", (int) bar);

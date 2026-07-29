@@ -157,6 +157,53 @@ local backgrounds = setmetatable({}, {__mode = 'k'})
 
 local panning_modes = {}
 
+-- A root pixmap is a Cairo/X11 target. Skia wallpapers are desktop drawins;
+-- their normal widget tree therefore renders through the same GPU canvas as a
+-- wibar instead of being rasterized into a root pixmap first.
+local function paint_skia_wallpapers()
+    local walls = {}
+    for _, wall in pairs(backgrounds) do
+        walls[wall] = true
+    end
+
+    for wall in pairs(walls) do
+        local geo = type(wall._private.panning_area) == "function" and
+            wall._private.panning_area(wall) or
+            panning_modes[wall._private.panning_area](wall)
+        if geo.width > 0 and geo.height > 0 then
+            if not wall._private.container then
+                wall._private.container = background()
+                wall._private.container.bg = wall._private.bg or beautiful.wallpaper_bg or "#000000"
+                wall._private.container.fg = wall._private.fg or beautiful.wallpaper_fg or "#ffffff"
+                wall._private.container.widget = wall.widget
+            end
+
+            local desktop = wall._private.skia_desktop
+            if not desktop then
+                desktop = require("wibox") {
+                    type = "desktop",
+                    ontop = false,
+                    visible = false,
+                    input_passthrough = true,
+                }
+                desktop.drawin.desktop = true
+                wall._private.skia_desktop = desktop
+            end
+
+            desktop.screen = wall.screens[1]
+            desktop:geometry(geo)
+            desktop.bg = wall._private.bg or beautiful.wallpaper_bg or "#000000"
+            desktop.fg = wall._private.fg or beautiful.wallpaper_fg or "#ffffff"
+            desktop.widget = wall._private.container
+            desktop.visible = true
+        end
+    end
+
+    for s in pairs(pending_repaint) do
+        pending_repaint[s] = nil
+    end
+end
+
 -- Get a list of all screen areas.
 local function get_rectangles(screens, honor_workarea, honor_padding)
     local ret = {}
@@ -251,6 +298,10 @@ end
 
 
 local function paint()
+    if rawget(_G, "skia") then
+        paint_skia_wallpapers()
+        return
+    end
     if not next(pending_repaint) then return end
 
     local root_width, root_height = capi.root.size()

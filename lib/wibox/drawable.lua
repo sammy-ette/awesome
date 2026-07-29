@@ -14,10 +14,12 @@ local capi = {
 }
 local beautiful = require("beautiful")
 local base = require("wibox.widget.base")
-local cairo = require("lgi").cairo
+local skia = rawget(_G, "skia")
+local cairo = skia and nil or require("lgi").cairo
 local color = require("gears.color")
 local object = require("gears.object")
-local surface = require("gears.surface")
+local surface = skia and nil or require("gears.surface")
+local region = require("gears.region")
 local timer = require("gears.timer")
 local grect =  require("gears.geometry").rectangle
 local matrix = require("gears.matrix")
@@ -27,10 +29,61 @@ local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility
 local visible_drawables = {}
 
 local systray_widget
+local get_widget_context
+
+local function do_redraw_skia(self, renderer)
+    local cr = skia.begin(renderer)
+    local geom = self.drawable:geometry()
+    local x, y, width, height = geom.x, geom.y, geom.width, geom.height
+    local context = get_widget_context(self)
+
+    if self._need_relayout or self._need_complete_repaint then
+        self._need_relayout = false
+        if self._widget_hierarchy and self._widget then
+            local had_systray = systray_widget and self._widget_hierarchy:get_count(systray_widget) > 0
+            self._widget_hierarchy:update(context, self._widget, width, height, self._dirty_area)
+            local has_systray = systray_widget and self._widget_hierarchy:get_count(systray_widget) > 0
+            if had_systray and not has_systray then
+                systray_widget:_kickout(context)
+            end
+        else
+            self._need_complete_repaint = true
+            if self._widget then
+                self._widget_hierarchy_callback_arg = {}
+                self._widget_hierarchy = whierarchy.new(context, self._widget, width, height,
+                    self._redraw_callback, self._layout_callback, self._widget_hierarchy_callback_arg)
+            else
+                self._widget_hierarchy = nil
+            end
+        end
+    end
+
+    -- Vulkan swapchains do not retain their contents across every resize and
+    -- exposure, so repaint the full drawin. The Cairo Region is only retained
+    -- here for layout invalidation during the transition; it is not a raster
+    -- target and never receives drawing commands.
+    self._need_complete_repaint = false
+    self._dirty_area = region.new()
+    cr:clip_rect(0, 0, width, height)
+    cr:set_source(self._background_color_spec or "#000000")
+    cr:paint()
+
+    if self.background_image and type(self.background_image) == "function" then
+        self.background_image(context, cr, width, height, unpack(self.background_image_args))
+    end
+
+    if self._widget_hierarchy then
+        cr:set_source(self._foreground_color_spec or "#ffffff")
+        self._widget_hierarchy:draw(context, cr)
+    end
+
+    cr:present()
+    self.drawable:refresh()
+end
 
 -- Get the widget context. This should always return the same table (if
 -- possible), so that our draw and fit caches can work efficiently.
-local function get_widget_context(self)
+get_widget_context = function(self)
     local geom = self.drawable:geometry()
 
     local s = self._forced_screen
@@ -66,6 +119,14 @@ end
 local function do_redraw(self)
     if not self.drawable.valid then return end
     if self._forced_screen and not self._forced_screen.valid then return end
+
+    if skia then
+        local renderer = self.drawable.skia_renderer
+        if not renderer then
+            error("Skia/Vulkan could not create a drawable renderer; refusing Cairo fallback")
+        end
+        return do_redraw_skia(self, renderer)
+    end
 
     local surf = surface.load_silently(self.drawable.surface, false)
     -- The surface can be nil if the drawable's parent was already finalized
@@ -244,6 +305,7 @@ end
 -- @see gears.color
 function drawable:set_bg(c)
     c = c or "#000000"
+    self._background_color_spec = c
     local t = type(c)
 
     if t == "string" or t == "table" then
@@ -277,7 +339,17 @@ end
 -- @param image A background image or a function
 function drawable:set_bgimage(image, ...)
     if type(image) ~= "function" then
-        image = surface(image)
+        if skia then
+            if type(image) ~= "string" then
+                error("Skia background images must be a function or a file path")
+            end
+            -- Wrap the path in a draw callback so it flows through the same
+            -- function-image handling as procedurally-drawn backgrounds.
+            local path = image
+            image = function(_, cr) cr:draw_image(path, 0, 0) end
+        else
+            image = surface(image)
+        end
     end
 
     self.background_image = image
@@ -292,6 +364,7 @@ end
 -- @see gears.color
 function drawable:set_fg(c)
     c = c or "#FFFFFF"
+    self._foreground_color_spec = c
     if type(c) == "string" or type(c) == "table" then
         c = color(c)
     end
@@ -381,7 +454,7 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     ret._widget_context_skeleton = widget_context_skeleton
     ret._need_complete_repaint = true
     ret._need_relayout = true
-    ret._dirty_area = cairo.Region.create()
+    ret._dirty_area = skia and region.new() or cairo.Region.create()
     setup_signals(ret)
 
     for k, v in pairs(drawable) do

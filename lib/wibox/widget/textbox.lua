@@ -16,17 +16,33 @@ local beautiful = require("beautiful")
 local lgi = require("lgi")
 local gtable = require("gears.table")
 local Pango = lgi.Pango
-local PangoCairo = lgi.PangoCairo
+local PangoCairo = rawget(_G, "skia") and nil or lgi.PangoCairo
+local PangoFT2 = rawget(_G, "skia") and lgi.PangoFT2 or nil
 local setmetatable = setmetatable
 
 local textbox = { mt = {} }
+
+local function new_pango_context()
+    if PangoFT2 then
+        local font_map = PangoFT2.FontMap.new()
+        return font_map, font_map:create_context()
+    end
+    return nil, PangoCairo.font_map_get_default():create_context()
+end
 
 --- Set the DPI of a Pango layout
 local function setup_dpi(box, dpi)
     assert(dpi, "No DPI provided")
     if box._private.dpi ~= dpi then
         box._private.dpi = dpi
-        box._private.ctx:set_resolution(dpi)
+        if box._private.font_map then
+            -- PangoFT2 keeps resolution on its font map, unlike PangoCairo's
+            -- context. Calling Context:set_resolution silently prevented every
+            -- Skia textbox from reaching its draw step.
+            box._private.font_map:set_resolution(dpi, dpi)
+        else
+            box._private.ctx:set_resolution(dpi)
+        end
         box._private.layout:context_changed()
     end
 end
@@ -41,7 +57,6 @@ end
 -- Draw the given textbox on the given cairo context in the given geometry
 function textbox:draw(context, cr, width, height)
     setup_layout(self, width, height, context.dpi)
-    cr:update_layout(self._private.layout)
     local _, logical = self._private.layout:get_pixel_extents()
     local offset = 0
     if self._private.valign == "center" then
@@ -49,8 +64,17 @@ function textbox:draw(context, cr, width, height)
     elseif self._private.valign == "bottom" then
         offset = height - logical.height
     end
-    cr:move_to(0, offset)
-    cr:show_layout(self._private.layout)
+    if cr.show_text then
+        -- The Skia canvas renders text directly. Pango remains responsible for
+        -- markup parsing, wrapping, ellipsizing, and measurement until its
+        -- shaping output is moved into the Skia text bridge.
+        cr:show_text(self._private.layout.text, 0, offset + logical.height,
+            "sans", logical.height)
+    else
+        cr:update_layout(self._private.layout)
+        cr:move_to(0, offset)
+        cr:show_layout(self._private.layout)
+    end
 end
 
 local function do_fit_return(self)
@@ -510,7 +534,7 @@ local function new(text, ignore_markup)
     gtable.crush(ret, textbox, true)
 
     ret._private.dpi = -1
-    ret._private.ctx = PangoCairo.font_map_get_default():create_context()
+    ret._private.font_map, ret._private.ctx = new_pango_context()
     ret._private.layout = Pango.Layout.new(ret._private.ctx)
     ret._private.layout:set_font_description(beautiful.get_font(beautiful.font))
 
@@ -543,11 +567,15 @@ end
 -- @staticfct wibox.widget.textbox.get_markup_geometry
 function textbox.get_markup_geometry(text, s, font)
     font = font or beautiful.font
-    local pctx = PangoCairo.font_map_get_default():create_context()
+    local font_map, pctx = new_pango_context()
     local playout = Pango.Layout.new(pctx)
     playout:set_font_description(beautiful.get_font(font))
     local dpi_scale = beautiful.xresources.get_dpi(s)
-    pctx:set_resolution(dpi_scale)
+    if font_map then
+        font_map:set_resolution(dpi_scale, dpi_scale)
+    else
+        pctx:set_resolution(dpi_scale)
+    end
     playout:context_changed()
     local attr, parsed = Pango.parse_markup(text, -1, 0)
     playout.attributes, playout.text = attr, parsed

@@ -78,6 +78,225 @@
 
 #include <xcb/xcb_atom.h>
 #include <xcb/xcb_aux.h>
+
+#ifdef WITH_SKIA_VULKAN
+#include "render/skia/skia_backend.h"
+#include "render/skia/skia_lua.h"
+
+/* The public Lua entry point deliberately starts small: it exposes a direct
+ * GPU frame for code that has already migrated off lgi.cairo. Keeping the
+ * frame as userdata makes an accidental second present or use-after-present
+ * a Lua error instead of a Vulkan lifetime bug. */
+#define AWESOME_SKIA_FRAME_METATABLE "awesome.skia.frame"
+
+typedef struct
+{
+    awesome_skia_frame_t *frame;
+} luaA_skia_frame_t;
+
+static luaA_skia_frame_t *
+luaA_check_skia_frame(lua_State *L, int index)
+{
+    luaA_skia_frame_t *frame = luaL_checkudata(L, index,
+                                                AWESOME_SKIA_FRAME_METATABLE);
+    if (!frame->frame)
+        luaL_error(L, "Skia frame has already been presented");
+    return frame;
+}
+
+static uint32_t
+luaA_check_skia_color(lua_State *L, int index)
+{
+    lua_Integer color = luaL_checkinteger(L, index);
+    if (color < 0 || (uint64_t) color > UINT32_MAX)
+        luaL_argerror(L, index, "expected a 0xRRGGBBAA color");
+    return (uint32_t) color;
+}
+
+static int
+luaA_skia_begin(lua_State *L)
+{
+    awesome_skia_renderer_t *renderer = lua_touserdata(L, 1);
+    if (!renderer)
+        return luaL_argerror(L, 1, "expected drawable.skia_renderer");
+
+    char error[256] = {0};
+    awesome_skia_frame_t *native = awesome_skia_renderer_begin_frame(
+        renderer, error, sizeof(error));
+    if (!native)
+        return luaL_error(L, "could not begin Skia frame: %s", error);
+
+    luaA_skia_frame_t *frame = lua_newuserdata(L, sizeof(*frame));
+    frame->frame = native;
+    luaL_getmetatable(L, AWESOME_SKIA_FRAME_METATABLE);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+static int
+luaA_skia_frame_clear(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_clear(frame->frame, luaA_check_skia_color(L, 2));
+    return 0;
+}
+
+static int
+luaA_skia_frame_save(lua_State *L)
+{
+    awesome_skia_frame_save(luaA_check_skia_frame(L, 1)->frame);
+    return 0;
+}
+
+static int
+luaA_skia_frame_restore(lua_State *L)
+{
+    awesome_skia_frame_restore(luaA_check_skia_frame(L, 1)->frame);
+    return 0;
+}
+
+static int
+luaA_skia_frame_translate(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_translate(frame->frame, luaL_checknumber(L, 2),
+                                 luaL_checknumber(L, 3));
+    return 0;
+}
+
+static int
+luaA_skia_frame_scale(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_scale(frame->frame, luaL_checknumber(L, 2),
+                             luaL_checknumber(L, 3));
+    return 0;
+}
+
+static int
+luaA_skia_frame_clip_rect(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_clip_rect(frame->frame, luaL_checknumber(L, 2),
+                                 luaL_checknumber(L, 3), luaL_checknumber(L, 4),
+                                 luaL_checknumber(L, 5));
+    return 0;
+}
+
+static int
+luaA_skia_frame_fill_rect(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_draw_rect(frame->frame, luaL_checknumber(L, 2),
+                                 luaL_checknumber(L, 3), luaL_checknumber(L, 4),
+                                 luaL_checknumber(L, 5),
+                                 luaA_check_skia_color(L, 6));
+    return 0;
+}
+
+static int
+luaA_skia_frame_fill_round_rect(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_draw_round_rect(frame->frame,
+                                       luaL_checknumber(L, 2), luaL_checknumber(L, 3),
+                                       luaL_checknumber(L, 4), luaL_checknumber(L, 5),
+                                       luaL_checknumber(L, 6), luaL_checknumber(L, 7),
+                                       luaA_check_skia_color(L, 8));
+    return 0;
+}
+
+static int
+luaA_skia_frame_fill_circle(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    awesome_skia_frame_draw_circle(frame->frame, luaL_checknumber(L, 2),
+                                   luaL_checknumber(L, 3), luaL_checknumber(L, 4),
+                                   luaA_check_skia_color(L, 5));
+    return 0;
+}
+
+static int
+luaA_skia_frame_present(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaA_check_skia_frame(L, 1);
+    char error[256] = {0};
+    awesome_skia_frame_t *native = frame->frame;
+    frame->frame = NULL;
+    if (!awesome_skia_renderer_end_frame(native, error, sizeof(error)))
+        return luaL_error(L, "could not present Skia frame: %s", error);
+    return 0;
+}
+
+static int
+luaA_skia_frame_gc(lua_State *L)
+{
+    luaA_skia_frame_t *frame = luaL_checkudata(L, 1,
+                                                AWESOME_SKIA_FRAME_METATABLE);
+    if (frame->frame)
+    {
+        char ignored_error[256] = {0};
+        awesome_skia_renderer_end_frame(frame->frame, ignored_error,
+                                        sizeof(ignored_error));
+        frame->frame = NULL;
+    }
+    return 0;
+}
+
+static const struct luaL_Reg awesome_skia_frame_meta[] =
+{
+    { "clear", luaA_skia_frame_clear },
+    { "save", luaA_skia_frame_save },
+    { "restore", luaA_skia_frame_restore },
+    { "translate", luaA_skia_frame_translate },
+    { "scale", luaA_skia_frame_scale },
+    { "clip_rect", luaA_skia_frame_clip_rect },
+    { "fill_rect", luaA_skia_frame_fill_rect },
+    { "fill_round_rect", luaA_skia_frame_fill_round_rect },
+    { "fill_circle", luaA_skia_frame_fill_circle },
+    { "present", luaA_skia_frame_present },
+    { "__gc", luaA_skia_frame_gc },
+    { NULL, NULL },
+};
+
+static const struct luaL_Reg awesome_skia_lib[] =
+{
+    { "begin", luaA_skia_begin },
+    { NULL, NULL },
+};
+
+static int
+luaA_skia_require(lua_State *L)
+{
+    lua_getglobal(L, "skia");
+    return 1;
+}
+
+static void
+luaA_skia_setup_require(lua_State *L)
+{
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "preload");
+    lua_pushcfunction(L, luaA_skia_require);
+    lua_setfield(L, -2, "skia");
+    lua_pop(L, 2);
+}
+
+static void
+luaA_skia_setup(lua_State *L)
+{
+    luaL_newmetatable(L, AWESOME_SKIA_FRAME_METATABLE);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, -2, "__index");
+    luaA_setfuncs(L, awesome_skia_frame_meta);
+    lua_pop(L, 1);
+
+    luaA_registerlib(L, "skia", awesome_skia_lib);
+    lua_pop(L, 1);
+    luaA_skia_setup_require(L);
+    awesome_skia_lua_extend(L);
+}
+#endif
 #include "xkb_utf32_to_keysym_compat.c"
 
 #include <unistd.h> /* for gethostname() */
@@ -1128,6 +1347,10 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
     luaL_openlibs(L);
 
     luaA_fixups(L);
+
+#ifdef WITH_SKIA_VULKAN
+    luaA_skia_setup(L);
+#endif
 
     luaA_object_setup(L);
 

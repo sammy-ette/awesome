@@ -108,6 +108,10 @@ lua_class_t drawin_class;
  */
 
 /**
+ * @signal property::input_passthrough
+ */
+
+/**
  * @signal property::visible
  */
 
@@ -432,9 +436,6 @@ drawin_allocator(lua_State *L)
     w->geometry_dirty = false;
     w->type = _NET_WM_WINDOW_TYPE_NORMAL;
 
-    drawable_allocator(L, (drawable_refresh_callback *) drawin_refresh_pixmap, w);
-    w->drawable = luaA_object_ref_item(L, -2, -1);
-
     w->window = xcb_generate_id(globalconf.connection);
     xcb_create_window(globalconf.connection, globalconf.default_depth, w->window, s->root,
                       w->geometry.x, w->geometry.y,
@@ -457,6 +458,12 @@ drawin_allocator(lua_State *L)
                           globalconf.default_cmap,
                           xcursor_new(&globalconf.cursor_cache, globalconf.cursor_ctx, w->cursor)
                       });
+    drawable_allocator(L, (drawable_refresh_callback *) drawin_refresh_pixmap, w
+#ifdef WITH_SKIA_VULKAN
+                       , w->window
+#endif
+                       );
+    w->drawable = luaA_object_ref_item(L, -2, -1);
     if (globalconf.is_compositing)
         xcb_composite_redirect_subwindows(globalconf.connection, w->window, XCB_COMPOSITE_REDIRECT_MANUAL);
     xwindow_set_class_instance(w->window);
@@ -685,6 +692,32 @@ luaA_drawin_get_drawable(lua_State *L, drawin_t *drawin)
     return 1;
 }
 
+/** Set whether this drawin receives input events.
+ *
+ * An empty X Shape input region is the protocol-native representation of a
+ * click-through window.  In particular, do not manufacture the historical
+ * Cairo A1 surface here: Skia-backed desktop drawins must remain GPU-only.
+ */
+static int
+luaA_drawin_set_input_passthrough(lua_State *L, drawin_t *drawin)
+{
+    bool value = luaA_checkboolean(L, -1);
+
+    if (globalconf.have_shape && globalconf.have_input_shape)
+    {
+        if (value)
+            xcb_shape_rectangles(globalconf.connection, XCB_SHAPE_SO_SET,
+                    XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED,
+                    drawin->window, 0, 0, 0, NULL);
+        else
+            xcb_shape_mask(globalconf.connection, XCB_SHAPE_SO_SET,
+                    XCB_SHAPE_SK_INPUT, drawin->window, 0, 0, XCB_NONE);
+    }
+
+    luaA_object_emit_signal(L, -3, "property::input_passthrough", 0);
+    return 0;
+}
+
 /** Get the drawin's bounding shape.
  * \param L The Lua VM state.
  * \param drawin The drawin object.
@@ -877,6 +910,10 @@ drawin_class_setup(lua_State *L)
                             (lua_class_propfunc_t) luaA_drawin_set_shape_input,
                             (lua_class_propfunc_t) luaA_drawin_get_shape_input,
                             (lua_class_propfunc_t) luaA_drawin_set_shape_input);
+    luaA_class_add_property(&drawin_class, "input_passthrough",
+                            (lua_class_propfunc_t) luaA_drawin_set_input_passthrough,
+                            NULL,
+                            (lua_class_propfunc_t) luaA_drawin_set_input_passthrough);
 }
 
 // vim: filetype=c:expandtab:shiftwidth=4:tabstop=8:softtabstop=4:textwidth=80

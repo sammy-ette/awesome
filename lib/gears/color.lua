@@ -47,7 +47,7 @@ local ipairs = ipairs
 local pairs = pairs
 local type = type
 local lgi = require("lgi")
-local cairo = lgi.cairo
+local cairo = rawget(_G, "skia") or lgi.cairo
 local Pango = lgi.Pango
 local surface = require("gears.surface")
 

@@ -10,13 +10,18 @@
 -- @containermod wibox.container.tile
 -- @supermodule wibox.container.place
 local place = require("wibox.container.place")
-local cairo = require("lgi").cairo
-local widget = require("wibox.widget")
+local skia = rawget(_G, "skia")
+local cairo = skia and nil or require("lgi").cairo
+local widget = skia and nil or require("wibox.widget")
+local base = require("wibox.widget.base")
 local gtable = require("gears.table")
 
 local module = {mt = {}}
 
 function module:draw(context, cr, width, height)
+    -- Skia keeps each repeated child in the hierarchy.  Rendering them as
+    -- layouts avoids the legacy Cairo image-surface/pattern cache entirely.
+    if skia and skia.is_canvas(cr) then return end
     if not self._private.tiled then return end
     if not self._private.widget then return end
 
@@ -87,6 +92,46 @@ function module:draw(context, cr, width, height)
     cr:restore()
 end
 
+-- A Cairo pattern repeats a CPU-rasterized child.  The GPU equivalent is to
+-- place that child once for each visible tile, leaving the canvas and image
+-- decoding on the Skia path.  This also preserves ordinary widget semantics:
+-- every copy is laid out and clipped by the normal hierarchy.
+function module:layout(context, width, height)
+    if not skia or not self._private.tiled then
+        return place.layout(self, context, width, height)
+    end
+    if not self._private.widget then return end
+
+    local x, y, child_width, child_height = self:_layout(context, width, height)
+    if child_width <= 0 or child_height <= 0 then return end
+
+    local horizontal_step = child_width + self.horizontal_spacing
+    local vertical_step = child_height + self.vertical_spacing
+    if horizontal_step <= 0 or vertical_step <= 0 then return end
+
+    local first_x = x + math.floor((0 - x) / horizontal_step) * horizontal_step
+    local first_y = y + math.floor((0 - y) / vertical_step) * vertical_step
+    local result = {}
+
+    for tile_y = first_y, height, vertical_step do
+        local y_visible = tile_y + child_height > 0 and tile_y < height
+        local y_complete = tile_y >= 0 and tile_y + child_height <= height
+        if y_visible and (not self.vertical_crop or y_complete) then
+            for tile_x = first_x, width, horizontal_step do
+                local x_visible = tile_x + child_width > 0 and tile_x < width
+                local x_complete = tile_x >= 0 and tile_x + child_width <= width
+                if x_visible and (not self.horizontal_crop or x_complete) then
+                    table.insert(result, base.place_widget_at(
+                        self._private.widget, tile_x, tile_y, child_width, child_height
+                    ))
+                end
+            end
+        end
+    end
+
+    return result
+end
+
 --- The horizontal spacing between the tiled.
 --
 --@DOC_wibox_container_tile_horizontal_spacing_EXAMPLE@
@@ -147,7 +192,7 @@ for prop in pairs(defaults) do
 
     module["set_"..prop] = function(self, value)
         self._private[prop] = value
-        self:emit_signal("widget::redraw_needed", value)
+        self:emit_signal(skia and "widget::layout_changed" or "widget::redraw_needed", value)
     end
 
     module["get_"..prop] = function(self)
@@ -171,6 +216,7 @@ local function new(_, args)
 
     -- Resize the pattern as needed.
     local function reset()
+        if skia then return end
         if ret._private.surface then
             ret._private.surface:finish()
         end

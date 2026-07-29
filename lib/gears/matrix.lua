@@ -6,7 +6,7 @@
 -- @classmod gears.matrix
 ---------------------------------------------------------------------------
 
-local cairo = require("lgi").cairo
+local cairo
 local matrix = {}
 
 -- Metatable for matrix instances. This is set up near the end of the file.
@@ -198,6 +198,7 @@ end
 --- Convert to a cairo matrix
 -- @treturn cairo.Matrix A cairo matrix describing the same transformation.
 function matrix:to_cairo_matrix()
+    cairo = cairo or require("lgi").cairo
     local ret = cairo.Matrix()
     ret:init(self.xx, self.yx, self.xy, self.yy, self.x0, self.y0)
     return ret

@@ -11,9 +11,10 @@
 
 local base = require("wibox.widget.base")
 local color = require("gears.color")
-local surface = require("gears.surface")
 local beautiful = require("beautiful")
-local cairo = require("lgi").cairo
+local skia = rawget(_G, "skia")
+local surface = skia and nil or require("gears.surface")
+local cairo = skia and nil or require("lgi").cairo
 local gtable = require("gears.table")
 local gshape = require("gears.shape")
 local gdebug = require("gears.debug")
@@ -22,6 +23,31 @@ local type = type
 local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility with Lua 5.1)
 
 local background = { mt = {} }
+
+local function is_skia_canvas(cr)
+    return skia and skia.is_canvas(cr)
+end
+
+-- A hierarchy can still be painted into a legacy Cairo target (notably the
+-- X11 root wallpaper) while drawins use Skia. Retain the declarative value so
+-- that the target, rather than module load order, selects its source object.
+local function cairo_source(value)
+    if type(value) ~= "string" then
+        return value
+    end
+    local red, green, blue, alpha = color.parse_color(value)
+    if red then
+        return cairo.Pattern.create_rgba(red, green, blue, alpha)
+    end
+    return value
+end
+
+local function source_for(cr, value, specification)
+    if is_skia_canvas(cr) then
+        return value
+    end
+    return cairo_source(specification or value)
+end
 
 -- If a background is resized with the mouse, it might create a large
 -- number of scaled texture. After the cache grows beyond this number, it
@@ -83,7 +109,7 @@ local function stretch_radial_gradient(input, width, height)
 end
 
 local function get_pattern_size(pat)
-    local t = pat.type
+    local t = pat.get_type and pat:get_type() or pat.type
 
     if t == "LINEAR" then
         local _, _, _, x1, y1 = pat:get_linear_points()
@@ -135,7 +161,7 @@ local function stretch_common(self, width, height)
         self._private.scale_cache_size = self._private.scale_cache_size + 1
     end
 
-    local t, new = old.type
+    local t, new = old.get_type and old:get_type() or old.type
 
     if t == "LINEAR" then
         new = stretch_lineal_gradient(old, size_w, size_h)
@@ -227,7 +253,8 @@ function background._use_fallback_algorithm()
             mask_cr:fill()
             mask:flush()
 
-            cr:set_source(color(self._private.shape_border_color or self._private.foreground or beautiful.fg_normal))
+            cr:set_source(source_for(cr, color(self._private.shape_border_color or self._private.foreground or beautiful.fg_normal),
+                self._private.shape_border_color_spec or self._private.foreground_spec or beautiful.fg_normal))
             cr:mask_surface(mask, 0,0)
             cr:restore()
         end
@@ -247,6 +274,48 @@ function background:before_draw_children(context, cr, width, height)
     local bw    = self._private.shape_border_width or 0
     local shape = self._private.shape or (bw > 0 and gshape.rectangle or nil)
 
+    -- Shapes used to redirect all children through a Cairo group/mask.  On a
+    -- Skia canvas the same result is obtained by clipping the GPU canvas
+    -- before the hierarchy draws its children, then stroking the outline once
+    -- the clip is restored.  No intermediate raster surface is involved.
+    if is_skia_canvas(cr) then
+        if shape then
+            cr:save()
+            cr:translate(bw, bw)
+            shape(cr, width - 2*bw, height - 2*bw,
+                unpack(self._private.shape_args or {}))
+            cr:translate(-bw, -bw)
+            cr:clip()
+        end
+
+        local bg, bgimage = stretch_common(self, width, height)
+        if bg then
+            cr:save()
+            cr:set_source(source_for(cr, bg, self._private.background_spec))
+            cr:rectangle(0, 0, width, height)
+            cr:fill()
+            cr:restore()
+        end
+
+        if bgimage then
+            if type(self._private.bgimage) == "function" then
+                self._private.bgimage(context, cr, width, height,
+                    unpack(self._private.bgimage_args))
+            elseif type(self._private.bgimage) == "string" then
+                cr:draw_image(self._private.bgimage, 0, 0)
+            else
+                error("Skia backgrounds require a file path or drawing function; "
+                    .. "Cairo surface backgrounds are not a GPU resource")
+            end
+        end
+
+        if self._private.foreground then
+            cr:set_source(source_for(cr, self._private.foreground,
+                self._private.foreground_spec))
+        end
+        return
+    end
+
     -- Redirect drawing to a temporary surface if there is a shape
     if shape then
         cr:push_group_with_content(cairo.Content.COLOR_ALPHA)
@@ -257,7 +326,7 @@ function background:before_draw_children(context, cr, width, height)
     -- Draw the background
     if bg then
         cr:save()
-        cr:set_source(bg)
+        cr:set_source(source_for(cr, bg, self._private.background_spec))
         cr:rectangle(0, 0, width, height)
         cr:fill()
         cr:restore()
@@ -267,7 +336,7 @@ function background:before_draw_children(context, cr, width, height)
         cr:save()
         if type(self._private.bgimage) == "function" then
             self._private.bgimage(context, cr, width, height,unpack(self._private.bgimage_args))
-        else
+        elseif not is_skia_canvas(cr) then
             local pattern = cairo.Pattern.create_for_surface(self._private.bgimage)
             cr:set_source(pattern)
             cr:rectangle(0, 0, width, height)
@@ -277,7 +346,7 @@ function background:before_draw_children(context, cr, width, height)
     end
 
     if self._private.foreground then
-        cr:set_source(self._private.foreground)
+        cr:set_source(source_for(cr, self._private.foreground, self._private.foreground_spec))
     end
 end
 
@@ -285,6 +354,26 @@ end
 function background:after_draw_children(_, cr, width, height)
     local bw    = self._private.shape_border_width or 0
     local shape = self._private.shape or (bw > 0 and gshape.rectangle or nil)
+
+    if is_skia_canvas(cr) then
+        if not shape then return end
+
+        -- Match the save/clip established in before_draw_children().
+        cr:restore()
+        if bw > 0 then
+            cr:save()
+            cr:translate(bw, bw)
+            shape(cr, width - 2*bw, height - 2*bw,
+                unpack(self._private.shape_args or {}))
+            cr:translate(-bw, -bw)
+            cr:set_source(self._private.shape_border_color
+                or self._private.foreground or beautiful.fg_normal)
+            cr:set_line_width(2*bw)
+            cr:stroke()
+            cr:restore()
+        end
+        return
+    end
 
     if not shape then
         return
@@ -441,6 +530,7 @@ end
 -- @propemits true false
 
 function background:set_bg(bg)
+    self._private.background_spec = bg
     if bg then
         self._private.background = color(bg)
     else
@@ -466,6 +556,7 @@ end
 -- @see gears.color
 
 function background:set_fg(fg)
+    self._private.foreground_spec = fg
     if fg then
         self._private.foreground = color(fg)
     else
@@ -665,7 +756,11 @@ end
 -- @see wibox.layout.stack
 
 function background:set_bgimage(image, ...)
-    self._private.bgimage = type(image) == "function" and image or surface.load(image)
+    if type(image) == "function" or (skia and type(image) == "string") then
+        self._private.bgimage = image
+    else
+        self._private.bgimage = surface.load(image)
+    end
     self._private.bgimage_args = {...}
     self:emit_signal("widget::redraw_needed")
     self:emit_signal("property::bgimage", image)

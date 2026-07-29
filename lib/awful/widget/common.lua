@@ -173,7 +173,7 @@ function common.list_update(w, buttons, label, data, objects, args)
 
             --TODO v5 remove this if, it existed only for a removed and
             -- undocumented API
-            if type(bg_image) ~= "function" then
+            if type(bg_image) ~= "function" or rawget(_G, "skia") then
                 cache.bgb:set_bgimage(bg_image)
             else
                 gdebug.deprecate("If you read this, you used an undocumented API"..

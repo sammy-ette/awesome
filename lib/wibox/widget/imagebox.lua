@@ -26,6 +26,7 @@
 
 local lgi = require("lgi")
 local cairo = lgi.cairo
+local skia = rawget(_G, "skia")
 
 local base = require("wibox.widget.base")
 local surface = require("gears.surface")
@@ -308,7 +309,11 @@ function imagebox:draw(ctx, cr, width, height)
         end
     end
 
-    if self._private.handle then
+    if skia and skia.is_canvas(cr) then
+        if self._private.image then
+            cr:draw_image(self._private.image, 0, 0)
+        end
+    elseif self._private.handle then
         self._private.handle:render_cairo(cr)
     else
         -- Yes, it is possible that the vertical or horizontal policies both
@@ -407,14 +412,35 @@ function imagebox:set_image(image)
     -- Keep the original to prevent the cache from being GCed.
     self._private.original_image = image
 
-    if type(image) == "userdata" and not (Rsvg and Rsvg.Handle:is_type_of(image)) then
+    if skia and type(image) == "string" then
+        local width, height = skia.image_dimensions(image)
+        if not width then return false end
+        self._private.default = { width = width, height = height }
+        self._private.handle = nil
+        self._private.image = image
+        setup_succeed = true
+    elseif skia and skia.is_image(image) then
+        -- An offscreen-rendered image (e.g. beautiful.awesome_icon), not
+        -- backed by a file, so dimensions come from the image object itself.
+        self._private.default = { width = image.width, height = image.height }
+        self._private.handle = nil
+        self._private.image = image
+        setup_succeed = true
+    elseif skia and not image then
+        setup_succeed = true
+        self._private.handle = nil
+        self._private.image = nil
+        self._private.default = nil
+    end
+
+    if not skia and type(image) == "userdata" and not (Rsvg and Rsvg.Handle:is_type_of(image)) then
         -- This function is not documented to handle userdata objects, but
         -- historically it did, and it did by just assuming they refer to a
         -- cairo surface.
         image = surface.load(image)
     end
 
-    if type(image) == "string" then
+    if not setup_succeed and type(image) == "string" then
         -- try to load rsvg handle from file
         setup_succeed = load_and_apply(self, image, imagebox._load_rsvg_handle, set_handle)
 
@@ -422,14 +448,14 @@ function imagebox:set_image(image)
             -- rsvg handle failed, try to load cairo surface with pixbuf
             setup_succeed = load_and_apply(self, image, surface.load, set_surface)
         end
-    elseif Rsvg and Rsvg.Handle:is_type_of(image) then
+    elseif not setup_succeed and Rsvg and Rsvg.Handle:is_type_of(image) then
         -- try to apply given rsvg handle
         rsvg_handle_cache[image] = rsvg_handle_cache[image] or {}
         setup_succeed = set_handle(self, image, rsvg_handle_cache[image])
-    elseif cairo.Surface:is_type_of(image) then
+    elseif not setup_succeed and cairo.Surface:is_type_of(image) then
         -- try to apply given cairo surface
         setup_succeed = set_surface(self, image)
-    elseif not image then
+    elseif not setup_succeed and not image then
         -- nil as argument mean full imagebox reset
         setup_succeed = true
         self._private.handle = nil

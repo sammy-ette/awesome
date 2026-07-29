@@ -15,7 +15,8 @@ local dofile = dofile
 local setmetatable = setmetatable
 local lgi = require("lgi")
 local Pango = lgi.Pango
-local PangoCairo = lgi.PangoCairo
+local PangoCairo = rawget(_G, "skia") and nil or lgi.PangoCairo
+local PangoFT2 = rawget(_G, "skia") and lgi.PangoFT2 or nil
 local gears_debug = require("gears.debug")
 local Gio = require("lgi").Gio
 local protected_call = require("gears.protected_call")
@@ -36,6 +37,14 @@ local theme = {}
 local descs = setmetatable({}, { __mode = 'k' })
 local fonts = setmetatable({}, { __mode = 'v' })
 local active_font
+
+local function new_font_context()
+    if PangoFT2 then
+        local font_map = PangoFT2.FontMap.new()
+        return font_map, font_map:create_context()
+    end
+    return nil, PangoCairo.font_map_get_default():create_context()
+end
 
 
 -- luacheck: max comment line length 300
@@ -168,8 +177,13 @@ local function load_font(name)
 
     -- Load new font
     local desc = Pango.FontDescription.from_string(name)
-    local ctx = PangoCairo.font_map_get_default():create_context()
-    ctx:set_resolution(beautiful.xresources.get_dpi())
+    local font_map, ctx = new_font_context()
+    local dpi = beautiful.xresources.get_dpi()
+    if font_map then
+        font_map:set_resolution(dpi, dpi)
+    else
+        ctx:set_resolution(dpi)
+    end
 
     -- Apply default values from the context (e.g. a default font size)
     desc:merge(ctx:get_font_description(), false)

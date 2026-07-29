@@ -166,7 +166,11 @@ end
 function wibox:set_input_passthrough(value)
     rawset(self, "_input_passthrough", value)
 
-    if not value then
+    if rawget(_G, "skia") then
+        -- Keep GPU drawins out of the legacy Cairo A1-mask path.  The native
+        -- drawin property installs an empty X Shape input region directly.
+        self.drawin.input_passthrough = value
+    elseif not value then
         self.shape_input = nil
     else
         local img = cairo.ImageSurface(cairo.Format.A1, 0, 0)

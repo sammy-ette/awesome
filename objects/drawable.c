@@ -105,7 +105,11 @@ static lua_class_t drawable_class;
 LUA_OBJECT_FUNCS(drawable_class, drawable_t, drawable)
 
 drawable_t *
-drawable_allocator(lua_State *L, drawable_refresh_callback *callback, void *data)
+drawable_allocator(lua_State *L, drawable_refresh_callback *callback, void *data
+#ifdef WITH_SKIA_VULKAN
+                   , xcb_window_t presentation_window
+#endif
+                   )
 {
     drawable_t *d = drawable_new(L);
     d->refresh_callback = callback;
@@ -113,14 +117,26 @@ drawable_allocator(lua_State *L, drawable_refresh_callback *callback, void *data
     d->refreshed = false;
     d->surface = NULL;
     d->pixmap = XCB_NONE;
+#ifdef WITH_SKIA_VULKAN
+    d->skia_renderer = NULL;
+    d->presentation_window = presentation_window;
+#endif
     return d;
 }
 
 static void
 drawable_unset_surface(drawable_t *d)
 {
-    cairo_surface_finish(d->surface);
-    cairo_surface_destroy(d->surface);
+    if (d->surface)
+    {
+        cairo_surface_finish(d->surface);
+        cairo_surface_destroy(d->surface);
+    }
+#ifdef WITH_SKIA_VULKAN
+    if (d->skia_renderer)
+        awesome_skia_renderer_destroy(d->skia_renderer);
+    d->skia_renderer = NULL;
+#endif
     if (d->pixmap)
         xcb_free_pixmap(globalconf.connection, d->pixmap);
     d->refreshed = false;
@@ -146,6 +162,23 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
         drawable_unset_surface(d);
     if (area_changed && geom.width > 0 && geom.height > 0)
     {
+#ifdef WITH_SKIA_VULKAN
+        /* A drawin is presented directly from its Vulkan swapchain. Do not
+         * allocate the old Cairo/X pixmap at all: a Skia frame is the only
+         * rendering target exposed for this drawable. */
+        if (d->presentation_window != XCB_NONE)
+        {
+            char error[256] = {0};
+            d->skia_renderer = awesome_skia_renderer_create(
+                globalconf.connection, d->presentation_window,
+                geom.width, geom.height, error, sizeof(error));
+            if (!d->skia_renderer)
+                fatal("Could not create required Skia/Vulkan drawable renderer: %s", error);
+            luaA_object_emit_signal(L, didx, "property::surface", 0);
+        }
+        else
+#endif
+        {
         d->pixmap = xcb_generate_id(globalconf.connection);
         xcb_create_pixmap(globalconf.connection, globalconf.default_depth, d->pixmap,
                           globalconf.screen->root, geom.width, geom.height);
@@ -153,6 +186,7 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
                                               d->pixmap, globalconf.visual,
                                               geom.width, geom.height);
         luaA_object_emit_signal(L, didx, "property::surface", 0);
+        }
     }
 
     if (area_changed)
@@ -166,6 +200,18 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
     if (old.height != geom.height)
         luaA_object_emit_signal(L, didx, "property::height", 0);
 }
+
+#ifdef WITH_SKIA_VULKAN
+static int
+luaA_drawable_get_skia_renderer(lua_State *L, drawable_t *drawable)
+{
+    if (drawable->skia_renderer)
+        lua_pushlightuserdata(L, drawable->skia_renderer);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+#endif
 
 /** Get a drawable's surface
  * \param L The Lua VM state.
@@ -238,6 +284,12 @@ drawable_class_setup(lua_State *L)
                             NULL,
                             (lua_class_propfunc_t) luaA_drawable_get_surface,
                             NULL);
+#ifdef WITH_SKIA_VULKAN
+    luaA_class_add_property(&drawable_class, "skia_renderer",
+                            NULL,
+                            (lua_class_propfunc_t) luaA_drawable_get_skia_renderer,
+                            NULL);
+#endif
 }
 
 /* @DOC_cobject_COMMON@ */

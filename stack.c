@@ -170,8 +170,16 @@ stack_refresh()
     foreach(drawin, globalconf.drawins)
         if ((*drawin)->desktop)
         {
-            stack_window_above((*drawin)->window, next);
-            next = (*drawin)->window;
+            /* The first desktop drawin has no sibling, so the old helper did
+             * nothing and left a late-mapped wallpaper above every wibar.
+             * Explicitly lowering desktop windows anchors this layer below
+             * normal drawins. Keep the first desktop as the sibling so normal
+             * windows are raised above every desktop drawin. */
+            xcb_configure_window(globalconf.connection, (*drawin)->window,
+                                 XCB_CONFIG_WINDOW_STACK_MODE,
+                                 (uint32_t[]) { XCB_STACK_MODE_BELOW });
+            if (next == XCB_NONE)
+                next = (*drawin)->window;
         }   
 
     /* stack desktop windows */
