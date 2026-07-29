@@ -47,7 +47,10 @@ local ipairs = ipairs
 local pairs = pairs
 local type = type
 local lgi = require("lgi")
-local cairo = rawget(_G, "skia") or lgi.cairo
+local skia = rawget(_G, "skia")
+-- The Skia module stands in for the parts of the cairo namespace this module
+-- uses (Pattern in particular); anything Skia lacks needs an explicit branch.
+local cairo = skia or lgi.cairo
 local Pango = lgi.Pango
 local surface = require("gears.surface")
 
@@ -349,6 +352,19 @@ end
 -- @return Recolored image.
 -- @staticfct gears.color.recolor_image
 function color.recolor_image(image, new_color)
+    if skia then
+        -- Keep the source's alpha but replace its colour. Skia images are
+        -- immutable, so this composites into a fresh surface with SrcIn
+        -- rather than masking the image in place the way Cairo does.
+        image = surface.load(image)
+        local w, h = image:get_width(), image:get_height()
+        local canvas = skia.new_image_surface(math.max(w, 1), math.max(h, 1))
+        canvas:draw_image(image, 0, 0)
+        canvas:set_source(color.create_pattern(new_color))
+        canvas.operator = "IN"
+        canvas:paint()
+        return canvas:snapshot()
+    end
     image = surface.duplicate_surface(image)
     local cr = cairo.Context.create(image)
     cr:set_source(color.create_pattern(new_color))

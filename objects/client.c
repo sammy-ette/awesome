@@ -3557,8 +3557,10 @@ client_refresh_titlebar_partial(client_t *c, client_titlebar_t bar, int16_t x, i
     if (AREA_TOP(area) >= y + height || AREA_BOTTOM(area) <= y)
         return;
 
-    /* Redraw the affected parts */
-    cairo_surface_flush(c->titlebar[bar].drawable->surface);
+    /* Redraw the affected parts. A Skia raster drawable has no Cairo surface;
+     * it has already uploaded its pixels into the pixmap. */
+    if (c->titlebar[bar].drawable->surface)
+        cairo_surface_flush(c->titlebar[bar].drawable->surface);
     xcb_copy_area(globalconf.connection, c->titlebar[bar].drawable->pixmap, c->frame_window,
             globalconf.gc, x - area.x, y - area.y, x, y, width, height);
 }

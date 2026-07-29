@@ -21,6 +21,7 @@ local imagebox = require("wibox.widget.imagebox")
 local gtable  = require("gears.table")
 local beautiful = require("beautiful")
 local gsurface = require("gears.surface")
+local skia = rawget(_G, "skia")
 local dpi = require("beautiful.xresources").apply_dpi
 
 local icon = {}
@@ -79,8 +80,12 @@ function icon:draw(_, cr, width, height)
         y = math.floor((height - h) / 2)
     end
 
-    cr:set_source_surface(self._private.image, x, y)
-    cr:paint()
+    if skia then
+        cr:draw_image(self._private.image, x, y)
+    else
+        cr:set_source_surface(self._private.image, x, y)
+        cr:paint()
+    end
 end
 
 --- The attached notification.

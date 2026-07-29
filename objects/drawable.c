@@ -177,7 +177,23 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
             luaA_object_emit_signal(L, didx, "property::surface", 0);
         }
         else
-#endif
+        {
+            /* Titlebars share their client's frame window, so they cannot own
+             * a swapchain. Keep the pixmap Awesome blits to that window and
+             * let Skia render into it on the CPU instead of Cairo. */
+            char error[256] = {0};
+            d->pixmap = xcb_generate_id(globalconf.connection);
+            xcb_create_pixmap(globalconf.connection, globalconf.default_depth, d->pixmap,
+                              globalconf.screen->root, geom.width, geom.height);
+            d->skia_renderer = awesome_skia_renderer_create_raster(
+                globalconf.connection, d->pixmap, globalconf.gc,
+                globalconf.default_depth, geom.width, geom.height,
+                error, sizeof(error));
+            if (!d->skia_renderer)
+                fatal("Could not create required Skia raster drawable renderer: %s", error);
+            luaA_object_emit_signal(L, didx, "property::surface", 0);
+        }
+#else
         {
         d->pixmap = xcb_generate_id(globalconf.connection);
         xcb_create_pixmap(globalconf.connection, globalconf.default_depth, d->pixmap,
@@ -187,6 +203,7 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
                                               geom.width, geom.height);
         luaA_object_emit_signal(L, didx, "property::surface", 0);
         }
+#endif
     }
 
     if (area_changed)

@@ -9,6 +9,7 @@
 local setmetatable = setmetatable
 local type = type
 local capi = { awesome = awesome }
+local skia = rawget(_G, "skia")
 local cairo = require("lgi").cairo
 local GdkPixbuf = require("lgi").GdkPixbuf
 local color, beautiful = nil, nil
@@ -27,6 +28,11 @@ local surface_cache = setmetatable({}, { __mode = 'v' })
 
 local function get_default(arg)
     if type(arg) == 'nil' then
+        if skia then
+            -- Smallest valid stand-in: callers only ever measure or draw it,
+            -- and a zero-sized image cannot be created.
+            return skia.new_image_surface(1, 1):snapshot()
+        end
         return cairo.ImageSurface(cairo.Format.ARGB32, 0, 0)
     end
     return arg
@@ -44,6 +50,22 @@ function surface.load_uncached_silently(_surface, default)
     -- On nil, return some sane default
     if not _surface then
         return get_default(default)
+    end
+    if skia then
+        -- Under Skia an "image surface" is a skia.image: already-decoded ones
+        -- pass straight through, and file names are decoded by Skia itself.
+        if skia.is_image(_surface) then
+            return _surface
+        end
+        if type(_surface) == "string" then
+            local image, err = skia.load_image(_surface)
+            if not image then
+                return get_default(default), err
+            end
+            return image
+        end
+        return get_default(default),
+            "cannot convert a " .. type(_surface) .. " into a Skia image"
     end
     -- lgi cairo surfaces don't get changed either
     if cairo.Surface:is_type_of(_surface) then
@@ -135,6 +157,10 @@ end
 -- @return The surface's width and height.
 -- @staticfct get_size
 function surface.get_size(surf)
+    if skia then
+        surf = surface.load(surf)
+        return surf:get_width(), surf:get_height()
+    end
     local cr = cairo.Context(surf)
     local x, y, w, h = cr:clip_extents()
     return w - x, h - y
@@ -153,6 +179,15 @@ end
 -- @staticfct duplicate_surface
 function surface.duplicate_surface(s)
     s = surface.load(s)
+
+    if skia then
+        -- Skia images are immutable, so a "copy" is a fresh offscreen surface
+        -- with the source drawn into it, which the caller may then paint over.
+        local w, h = s:get_width(), s:get_height()
+        local copy = skia.new_image_surface(math.max(w, 1), math.max(h, 1))
+        copy:draw_image(s, 0, 0)
+        return copy:snapshot()
+    end
 
     -- Figure out surface size (this does NOT work for unbounded recording surfaces)
     local cr = cairo.Context(s)

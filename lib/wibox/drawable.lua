@@ -18,7 +18,7 @@ local skia = rawget(_G, "skia")
 local cairo = skia and nil or require("lgi").cairo
 local color = require("gears.color")
 local object = require("gears.object")
-local surface = skia and nil or require("gears.surface")
+local surface = require("gears.surface")
 local region = require("gears.region")
 local timer = require("gears.timer")
 local grect =  require("gears.geometry").rectangle
@@ -338,15 +338,13 @@ end
 -- as arguments. Any other arguments passed to this method will be appended.
 -- @param image A background image or a function
 function drawable:set_bgimage(image, ...)
-    if type(image) ~= "function" then
+    if image ~= nil and type(image) ~= "function" then
         if skia then
-            if type(image) ~= "string" then
-                error("Skia background images must be a function or a file path")
-            end
-            -- Wrap the path in a draw callback so it flows through the same
-            -- function-image handling as procedurally-drawn backgrounds.
-            local path = image
-            image = function(_, cr) cr:draw_image(path, 0, 0) end
+            -- gears.surface resolves a path or an existing skia.image; wrap
+            -- the result in a draw callback so it flows through the same
+            -- handling as a procedurally-drawn background.
+            local resolved = surface.load(image)
+            image = resolved and function(_, cr) cr:draw_image(resolved, 0, 0) end or nil
         else
             image = surface(image)
         end

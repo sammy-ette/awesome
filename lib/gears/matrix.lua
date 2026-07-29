@@ -211,6 +211,20 @@ function matrix.from_cairo_matrix(mat)
     return matrix.create(mat.xx, mat.yx, mat.xy, mat.yy, mat.x0, mat.y0)
 end
 
+--- Convert to the matrix type the active renderer's canvas accepts.
+--
+-- Under Skia this is the `gears.matrix` itself: a Skia canvas reads the same
+-- `xx`/`yx`/`xy`/`yy`/`x0`/`y0` fields directly, so no conversion happens.
+-- Under Cairo it is the equivalent `cairo.Matrix`.
+--
+-- @treturn gears.matrix|cairo.Matrix A matrix the canvas `:transform()` accepts.
+function matrix:to_native()
+    if rawget(_G, "skia") then
+        return self
+    end
+    return self:to_cairo_matrix()
+end
+
 matrix_mt.__index = matrix
 matrix_mt.__newindex = error
 matrix_mt.__eq = matrix.equals

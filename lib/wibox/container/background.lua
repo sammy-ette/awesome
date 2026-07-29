@@ -13,7 +13,8 @@ local base = require("wibox.widget.base")
 local color = require("gears.color")
 local beautiful = require("beautiful")
 local skia = rawget(_G, "skia")
-local surface = skia and nil or require("gears.surface")
+-- gears.surface resolves images for both renderers, so it is always needed.
+local surface = require("gears.surface")
 local cairo = skia and nil or require("lgi").cairo
 local gtable = require("gears.table")
 local gshape = require("gears.shape")
@@ -301,11 +302,13 @@ function background:before_draw_children(context, cr, width, height)
             if type(self._private.bgimage) == "function" then
                 self._private.bgimage(context, cr, width, height,
                     unpack(self._private.bgimage_args))
-            elseif type(self._private.bgimage) == "string" then
-                cr:draw_image(self._private.bgimage, 0, 0)
             else
-                error("Skia backgrounds require a file path or drawing function; "
-                    .. "Cairo surface backgrounds are not a GPU resource")
+                -- A file path or an already-decoded skia.image; gears.surface
+                -- resolves both to something draw_image() accepts.
+                local image = surface.load(self._private.bgimage)
+                if image then
+                    cr:draw_image(image, 0, 0)
+                end
             end
         end
 

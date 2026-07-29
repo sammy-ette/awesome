@@ -46,6 +46,7 @@
 #include <cairo-xcb.h>
 #include <xcb/shape.h>
 #include <xcb/composite.h>
+#include <xcb/xcb_aux.h>
 
 lua_class_t drawin_class;
 
@@ -200,10 +201,21 @@ drawin_wipe(drawin_t *w)
     w->drawable = NULL;
 }
 
+static void drawin_apply_moveresize(drawin_t *w);
+
 static void
 drawin_update_drawing(lua_State *L, int widx)
 {
     drawin_t *w = luaA_checkudata(L, widx, &drawin_class);
+#ifdef WITH_SKIA_VULKAN
+    /* A Vulkan swapchain is sized from the X window's *actual* geometry, not
+     * from the size we ask for. Drawins are created 1x1 and resized later, so
+     * the pending configure has to reach the server before the drawable is
+     * rebuilt; otherwise every drawin gets a 1px-wide swapchain and renders
+     * as a sliver. */
+    drawin_apply_moveresize(w);
+    xcb_aux_sync(globalconf.connection);
+#endif
     luaA_object_push_item(L, widx, w->drawable);
     drawable_set_geometry(L, -1, w->geometry);
     lua_pop(L, 1);
@@ -326,8 +338,9 @@ drawin_refresh_pixmap_partial(drawin_t *drawin,
     /* Make sure it really has the size it should have */
     drawin_apply_moveresize(drawin);
 
-    /* Make cairo do all pending drawing */
-    cairo_surface_flush(drawin->drawable->surface);
+    /* Make cairo do all pending drawing (no-op without a Cairo surface) */
+    if (drawin->drawable->surface)
+        cairo_surface_flush(drawin->drawable->surface);
     xcb_copy_area(globalconf.connection, drawin->drawable->pixmap,
                   drawin->window, globalconf.gc, x, y, x, y,
                   w, h);

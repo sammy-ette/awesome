@@ -25,8 +25,11 @@ extern "C" {
 #include "include/core/SkPaint.h"
 #include "include/core/SkPathBuilder.h"
 #include "include/core/SkRect.h"
+#include "include/core/SkPixmap.h"
 #include "include/core/SkShader.h"
+#include "include/core/SkStream.h"
 #include "include/core/SkSurface.h"
+#include "include/encode/SkPngEncoder.h"
 #include "include/effects/SkGradient.h"
 #include "include/ports/SkFontMgr_fontconfig.h"
 #include "include/ports/SkFontScanner_FreeType.h"
@@ -67,6 +70,18 @@ struct lua_skia_frame
     canvas_state state;
     std::vector<canvas_state> states;
     SkPoint current = {0, 0};
+    /* Cairo's new_sub_path() means "the next arc starts a fresh sub-path
+     * rather than connecting from the current point". Skia expresses that as
+     * the forceMoveTo argument to arcTo(), so record it until the arc lands. */
+    bool force_move_to = false;
+    /* Cairo transforms path points into device space as they are added, so a
+     * path built inside save()/transform()/restore() keeps that transform
+     * once filled outside it (gears.shape.transform relies on this). Skia
+     * builds the path untransformed and applies the canvas matrix at draw
+     * time, which would drop it. Capture the matrix in force when the path
+     * starts and draw with that instead. */
+    SkMatrix path_matrix;
+    bool has_path_matrix = false;
 };
 
 /* A decoded or rendered image ready to be drawn with frame:draw_image(). */
@@ -314,6 +329,8 @@ SkBlendMode blend_mode_from_operator(lua_State *L, int index)
         return SkBlendMode::kSrc;
     if (op && (std::strcmp(op, "CLEAR") == 0 || std::strcmp(op, "clear") == 0))
         return SkBlendMode::kClear;
+    if (op && (std::strcmp(op, "IN") == 0 || std::strcmp(op, "in") == 0))
+        return SkBlendMode::kSrcIn;
     return SkBlendMode::kSrcOver;
 }
 
@@ -321,6 +338,27 @@ void reset_path(lua_skia_frame *frame)
 {
     const SkPathFillType fill_type = frame->path.fillType();
     frame->path = SkPathBuilder(fill_type);
+    frame->has_path_matrix = false;
+}
+
+/* Pin the path to the transform in force when its first point is added. */
+void note_path_start(lua_skia_frame *frame)
+{
+    if (frame->has_path_matrix)
+        return;
+    frame->path_matrix = canvas(frame)->getTotalMatrix();
+    frame->has_path_matrix = true;
+}
+
+/* Draw the accumulated path under the matrix it was built with, rather than
+ * whatever transform happens to be current at fill/stroke time. */
+void draw_path(lua_skia_frame *frame, const SkPath &path, const SkPaint &paint)
+{
+    SkCanvas *target = canvas(frame);
+    SkAutoCanvasRestore restore(target, true);
+    if (frame->has_path_matrix)
+        target->setMatrix(frame->path_matrix);
+    target->drawPath(path, paint);
 }
 
 int frame_begin(lua_State *L)
@@ -391,8 +429,12 @@ int frame_restore(lua_State *L)
     if (frame->states.size() <= 1)
         return luaL_error(L, "Skia canvas restore without matching save");
     canvas(frame)->restore();
-    frame->states.pop_back();
+    /* save() pushed a snapshot of the then-current state, so restore() takes
+     * that snapshot back off the stack. Reading states.back() *after*
+     * popping would instead revert to the state one save() too far out,
+     * silently dropping the source colour set before the save(). */
     frame->state = frame->states.back();
+    frame->states.pop_back();
     return 0;
 }
 
@@ -468,6 +510,7 @@ int frame_clip_extents(lua_State *L)
 int frame_rectangle(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     frame->path.addRect(SkRect::MakeXYWH(luaL_checknumber(L, 2), luaL_checknumber(L, 3),
                                           luaL_checknumber(L, 4), luaL_checknumber(L, 5)));
     return 0;
@@ -476,15 +519,18 @@ int frame_rectangle(lua_State *L)
 int frame_move_to(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     frame->current = { static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        static_cast<SkScalar>(luaL_checknumber(L, 3)) };
     frame->path.moveTo(frame->current);
+    frame->force_move_to = false;
     return 0;
 }
 
 int frame_line_to(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     frame->current = { static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        static_cast<SkScalar>(luaL_checknumber(L, 3)) };
     frame->path.lineTo(frame->current);
@@ -494,6 +540,7 @@ int frame_line_to(lua_State *L)
 int frame_rel_move_to(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     frame->current = { frame->current.fX + static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        frame->current.fY + static_cast<SkScalar>(luaL_checknumber(L, 3)) };
     frame->path.moveTo(frame->current);
@@ -503,6 +550,7 @@ int frame_rel_move_to(lua_State *L)
 int frame_rel_line_to(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     frame->current = { frame->current.fX + static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        frame->current.fY + static_cast<SkScalar>(luaL_checknumber(L, 3)) };
     frame->path.lineTo(frame->current);
@@ -512,6 +560,7 @@ int frame_rel_line_to(lua_State *L)
 int frame_curve_to(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     const SkScalar x1 = luaL_checknumber(L, 2);
     const SkScalar y1 = luaL_checknumber(L, 3);
     const SkScalar x2 = luaL_checknumber(L, 4);
@@ -530,13 +579,44 @@ int frame_close_path(lua_State *L)
 
 int frame_new_path(lua_State *L)
 {
-    reset_path(check_frame(L, 1));
+    lua_skia_frame *frame = check_frame(L, 1);
+    reset_path(frame);
+    frame->force_move_to = false;
     return 0;
+}
+
+int frame_new_sub_path(lua_State *L)
+{
+    /* Keeps the accumulated path, but detaches the current point so a
+     * following arc does not draw a connecting line into it. */
+    check_frame(L, 1)->force_move_to = true;
+    return 0;
+}
+
+/* Append a Cairo-style arc to the current path.
+ *
+ * Skia's arcTo() emits nothing for a full revolution: the start and stop
+ * vectors coincide, so it produces zero conics. Cairo draws the whole circle,
+ * and gears.shape.circle relies on that, so a full sweep becomes an oval. */
+void append_arc(lua_skia_frame *frame, float x, float y, float radius,
+                float start, float sweep)
+{
+    const SkRect oval = SkRect::MakeXYWH(x - radius, y - radius, radius * 2, radius * 2);
+    constexpr float k_full = 2.0f * static_cast<float>(M_PI);
+
+    if (std::abs(sweep) >= k_full - 1e-4f)
+        frame->path.addOval(oval, sweep < 0 ? SkPathDirection::kCCW : SkPathDirection::kCW);
+    else
+        frame->path.arcTo(oval, start * 180.0f / static_cast<float>(M_PI),
+                          sweep * 180.0f / static_cast<float>(M_PI), frame->force_move_to);
+
+    frame->force_move_to = false;
 }
 
 int frame_arc(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     const float x = luaL_checknumber(L, 2);
     const float y = luaL_checknumber(L, 3);
     const float radius = luaL_checknumber(L, 4);
@@ -547,9 +627,7 @@ int frame_arc(lua_State *L)
         sweep += 2.0f * static_cast<float>(M_PI);
     if (sweep > 2.0f * static_cast<float>(M_PI))
         sweep = 2.0f * static_cast<float>(M_PI);
-    frame->path.arcTo(SkRect::MakeXYWH(x - radius, y - radius, radius * 2, radius * 2),
-                      start * 180.0f / static_cast<float>(M_PI),
-                      sweep * 180.0f / static_cast<float>(M_PI), false);
+    append_arc(frame, x, y, radius, start, sweep);
     frame->current = { x + radius * std::cos(finish), y + radius * std::sin(finish) };
     return 0;
 }
@@ -557,6 +635,7 @@ int frame_arc(lua_State *L)
 int frame_arc_negative(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    note_path_start(frame);
     const float x = luaL_checknumber(L, 2);
     const float y = luaL_checknumber(L, 3);
     const float radius = luaL_checknumber(L, 4);
@@ -567,9 +646,7 @@ int frame_arc_negative(lua_State *L)
         sweep -= 2.0f * static_cast<float>(M_PI);
     if (sweep < -2.0f * static_cast<float>(M_PI))
         sweep = -2.0f * static_cast<float>(M_PI);
-    frame->path.arcTo(SkRect::MakeXYWH(x - radius, y - radius, radius * 2, radius * 2),
-                      start * 180.0f / static_cast<float>(M_PI),
-                      sweep * 180.0f / static_cast<float>(M_PI), false);
+    append_arc(frame, x, y, radius, start, sweep);
     frame->current = { x + radius * std::cos(finish), y + radius * std::sin(finish) };
     return 0;
 }
@@ -579,7 +656,8 @@ int frame_fill(lua_State *L)
     lua_skia_frame *frame = check_frame(L, 1);
     SkPaint paint = frame->state.paint;
     paint.setStyle(SkPaint::kFill_Style);
-    canvas(frame)->drawPath(frame->path.detach(), paint);
+    draw_path(frame, frame->path.detach(), paint);
+    frame->has_path_matrix = false;
     return 0;
 }
 
@@ -588,7 +666,7 @@ int frame_fill_preserve(lua_State *L)
     lua_skia_frame *frame = check_frame(L, 1);
     SkPaint paint = frame->state.paint;
     paint.setStyle(SkPaint::kFill_Style);
-    canvas(frame)->drawPath(frame->path.snapshot(), paint);
+    draw_path(frame, frame->path.snapshot(), paint);
     return 0;
 }
 
@@ -597,7 +675,8 @@ int frame_stroke(lua_State *L)
     lua_skia_frame *frame = check_frame(L, 1);
     SkPaint paint = frame->state.paint;
     paint.setStyle(SkPaint::kStroke_Style);
-    canvas(frame)->drawPath(frame->path.detach(), paint);
+    draw_path(frame, frame->path.detach(), paint);
+    frame->has_path_matrix = false;
     return 0;
 }
 
@@ -606,7 +685,7 @@ int frame_stroke_preserve(lua_State *L)
     lua_skia_frame *frame = check_frame(L, 1);
     SkPaint paint = frame->state.paint;
     paint.setStyle(SkPaint::kStroke_Style);
-    canvas(frame)->drawPath(frame->path.snapshot(), paint);
+    draw_path(frame, frame->path.snapshot(), paint);
     return 0;
 }
 
@@ -766,19 +845,76 @@ int skia_new_image_surface(lua_State *L)
     return 1;
 }
 
+/* Wrap an SkImage as the awesome.skia.image userdata. */
+void push_image(lua_State *L, sk_sp<SkImage> source)
+{
+    auto *image = static_cast<lua_skia_image *>(lua_newuserdata(L, sizeof(lua_skia_image)));
+    new (image) lua_skia_image();
+    image->image = std::move(source);
+    luaL_getmetatable(L, k_image_type);
+    lua_setmetatable(L, -2);
+}
+
 int frame_snapshot(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
     if (!frame->offscreen)
         return luaL_error(L, "snapshot() only applies to an offscreen image surface "
                              "(created with skia.new_image_surface)");
-    auto *image = static_cast<lua_skia_image *>(lua_newuserdata(L, sizeof(lua_skia_image)));
-    new (image) lua_skia_image();
-    image->image = frame->offscreen->makeImageSnapshot();
+    push_image(L, frame->offscreen->makeImageSnapshot());
     frame->offscreen.reset();
-    luaL_getmetatable(L, k_image_type);
-    lua_setmetatable(L, -2);
     return 1;
+}
+
+/* skia.load_image(path) -> image, or nil plus a message. This is the Skia
+ * counterpart to gears.surface loading a file into a cairo surface. */
+int skia_load_image(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    sk_sp<SkImage> image = load_encoded_image(path);
+    if (!image)
+    {
+        lua_pushnil(L);
+        lua_pushfstring(L, "Skia could not decode image '%s'", path);
+        return 2;
+    }
+    push_image(L, std::move(image));
+    return 1;
+}
+
+int image_get_width(lua_State *L)
+{
+    auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
+    lua_pushinteger(L, image->image ? image->image->width() : 0);
+    return 1;
+}
+
+int image_get_height(lua_State *L)
+{
+    auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
+    lua_pushinteger(L, image->image ? image->image->height() : 0);
+    return 1;
+}
+
+/* Write the image out as a PNG. Intended for tests and for eyeballing what a
+ * widget actually rendered during the Cairo migration. */
+int image_save_png(lua_State *L)
+{
+    auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
+    const char *path = luaL_checkstring(L, 2);
+    if (!image->image)
+        return luaL_error(L, "Skia image has no pixel data");
+
+    SkPixmap pixmap;
+    if (!image->image->peekPixels(&pixmap))
+        return luaL_error(L, "Skia image is not raster-backed; cannot save '%s'", path);
+
+    SkFILEWStream stream(path);
+    if (!stream.isValid())
+        return luaL_error(L, "could not open '%s' for writing", path);
+    if (!SkPngEncoder::Encode(&stream, pixmap, SkPngEncoder::Options()))
+        return luaL_error(L, "could not encode PNG '%s'", path);
+    return 0;
 }
 
 int image_gc(lua_State *L)
@@ -790,6 +926,15 @@ int image_gc(lua_State *L)
 
 int image_index(lua_State *L)
 {
+    /* Methods registered in the metatable win; the names below are computed
+     * properties rather than stored fields. */
+    luaL_getmetatable(L, k_image_type);
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);
+    if (!lua_isnil(L, -1))
+        return 1;
+    lua_pop(L, 2);
+
     auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
     const char *name = luaL_checkstring(L, 2);
     if (std::strcmp(name, "width") == 0)
@@ -1052,6 +1197,9 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "scale", frame_scale);
     set_method(L, "rotate", frame_rotate);
     set_method(L, "transform_matrix", frame_transform_matrix);
+    /* Cairo spelling. A gears.matrix instance carries the same
+     * xx/yx/xy/yy/x0/y0 fields, so it is accepted without conversion. */
+    set_method(L, "transform", frame_transform_matrix);
     set_method(L, "clip", frame_clip);
     set_method(L, "clip_rect", frame_clip_rect);
     set_method(L, "clip_extents", frame_clip_extents);
@@ -1065,6 +1213,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "arc_negative", frame_arc_negative);
     set_method(L, "close_path", frame_close_path);
     set_method(L, "new_path", frame_new_path);
+    set_method(L, "new_sub_path", frame_new_sub_path);
     set_method(L, "fill", frame_fill);
     set_method(L, "fill_preserve", frame_fill_preserve);
     set_method(L, "stroke", frame_stroke);
@@ -1085,6 +1234,10 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     luaL_newmetatable(L, k_image_type);
     set_method(L, "__gc", image_gc);
     set_method(L, "__index", image_index);
+    set_method(L, "save_png", image_save_png);
+    /* Cairo surface spelling, so call sites that measure an icon work. */
+    set_method(L, "get_width", image_get_width);
+    set_method(L, "get_height", image_get_height);
     lua_pop(L, 1);
 
     luaL_newmetatable(L, k_pattern_type);
@@ -1107,6 +1260,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "is_image", skia_is_image);
     set_method(L, "image_dimensions", skia_image_dimensions);
     set_method(L, "new_image_surface", skia_new_image_surface);
+    set_method(L, "load_image", skia_load_image);
     lua_newtable(L);
     set_method(L, "create_rgba", pattern_create_rgba);
     set_method(L, "create_linear", pattern_create_linear);

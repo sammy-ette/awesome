@@ -2,4 +2,5 @@
 .version_stamp
 .*.sw?
 build
+build-skia
 .luacheckcache

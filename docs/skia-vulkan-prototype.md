@@ -119,10 +119,17 @@ This is not yet a complete Cairo removal. Awesome's installed Lua API exposes
 native `cairo_surface_t*` values, widgets pass Cairo contexts into user draw
 callbacks, and PangoCairo is used for text. Finishing the migration requires a
 breaking replacement canvas API (or a very large Cairo ABI compatibility
-implementation), a shared Vulkan device/Skia context for all windows, a frame
-compositor for client titlebars, and GPU-native shaped text. The code
-deliberately does not pretend that linking Skia makes those Cairo contracts
-disappear.
+implementation), a shared Vulkan device/Skia context for all windows, and
+GPU-native shaped text. The code deliberately does not pretend that linking
+Skia makes those Cairo contracts disappear.
+
+Client titlebars render through a second renderer mode. Up to four titlebars
+share one client frame window, so they cannot each own a swapchain; instead
+`awesome_skia_renderer_create_raster()` draws with Skia into a CPU surface and
+uploads it into the X pixmap Awesome already blits to the frame window. The
+Lua-facing canvas is identical to a GPU frame's, so no widget code knows the
+difference, and replacing this with a real GPU frame compositor later needs no
+Lua changes.
 
 GPU images are now bridged: `skia.new_image_surface(width, height)` creates an
 offscreen raster canvas (sharing the same Cairo-shaped drawing methods as a

@@ -335,11 +335,7 @@ function hierarchy:draw(context, cr)
     end
 
     cr:save()
-    if skia and skia.is_canvas(cr) then
-        cr:transform_matrix(self:get_matrix_to_parent())
-    else
-        cr:transform(self:get_matrix_to_parent():to_cairo_matrix())
-    end
+    cr:transform(self:get_matrix_to_parent():to_native())
 
     -- Clip to the draw extents
     local ext_x, ext_y, ext_width, ext_height = self:get_draw_extents()
