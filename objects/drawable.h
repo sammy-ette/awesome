@@ -38,6 +38,17 @@ struct drawable_t
     xcb_pixmap_t pixmap;
     /** Vulkan/Skia presenter for an X11 window, if this drawable owns one. */
     awesome_skia_renderer_t *skia_renderer;
+    /** Size of the swapchain currently owned by skia_renderer. Geometry is
+     * updated eagerly for Lua, while a Vulkan resize is deferred until the
+     * coalesced wibox redraw that will actually present it. */
+    uint16_t skia_renderer_width;
+    uint16_t skia_renderer_height;
+    /** Largest backing size requested by a drawin. Drawins present through a
+     * child window so their outer window can animate bounds without resizing
+     * the Vulkan swapchain every frame. */
+    uint16_t skia_capacity_width;
+    uint16_t skia_capacity_height;
+    bool skia_stable_backing;
     /** The X11 window to which the renderer presents directly. */
     xcb_window_t presentation_window;
     /** The geometry of the drawable (in root window coordinates). */
@@ -54,6 +65,7 @@ typedef struct drawable_t drawable_t;
 drawable_t *drawable_allocator(lua_State *, drawable_refresh_callback *, void *,
                                xcb_window_t);
 void drawable_set_geometry(lua_State *, int, area_t);
+void drawable_ensure_renderer(drawable_t *);
 void drawable_class_setup(lua_State *);
 
 #endif

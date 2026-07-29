@@ -148,6 +148,7 @@ struct awesome_skia_frame
     awesome_skia_renderer *renderer = nullptr;
     SkCanvas *canvas = nullptr;
     SkSurface *surface = nullptr;
+    int canvas_restore_count = 1;
     uint32_t image_index = 0;
     size_t sync_index = 0;
 };
@@ -157,6 +158,20 @@ struct frame_sync_t
     VkSemaphore image_available = VK_NULL_HANDLE;
     VkSemaphore render_finished = VK_NULL_HANDLE;
     VkFence recycle_fence = VK_NULL_HANDLE;
+};
+
+/* A resized swapchain can remain in use by presentation after its replacement
+ * has been created. Keep every resource that refers to it alive until the
+ * fences submitted after its final present have completed. This is the
+ * non-blocking counterpart to vkDeviceWaitIdle(): an animated drawin may
+ * resize again on the next tick without stalling every renderer on the
+ * shared device. */
+struct retired_swapchain_t
+{
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    std::vector<VkImage> images;
+    std::vector<sk_sp<SkSurface>> skia_surfaces;
+    std::vector<frame_sync_t> frame_sync;
 };
 
 /* Vulkan and Ganesh contexts are process-wide GPU resources, not per-window
@@ -217,12 +232,13 @@ struct awesome_skia_renderer
     std::vector<VkImage> images;
     std::vector<sk_sp<SkSurface>> skia_surfaces;
     std::vector<frame_sync_t> frame_sync;
+    std::vector<retired_swapchain_t> retired_swapchains;
     size_t next_sync = 0;
     awesome_skia_frame *active_frame = nullptr;
 
-    void destroy_frame_sync()
+    void destroy_frame_sync(std::vector<frame_sync_t> *sync_objects)
     {
-        for (const frame_sync_t& sync : frame_sync)
+        for (const frame_sync_t& sync : *sync_objects)
         {
             if (sync.image_available != VK_NULL_HANDLE)
                 vkDestroySemaphore(device, sync.image_available, nullptr);
@@ -231,8 +247,63 @@ struct awesome_skia_renderer
             if (sync.recycle_fence != VK_NULL_HANDLE)
                 vkDestroyFence(device, sync.recycle_fence, nullptr);
         }
-        frame_sync.clear();
+        sync_objects->clear();
+    }
+
+    void destroy_frame_sync()
+    {
+        destroy_frame_sync(&frame_sync);
         next_sync = 0;
+    }
+
+    void destroy_retired_swapchains()
+    {
+        for (retired_swapchain_t& retired : retired_swapchains)
+        {
+            destroy_frame_sync(&retired.frame_sync);
+            retired.skia_surfaces.clear();
+            retired.images.clear();
+            if (retired.swapchain != VK_NULL_HANDLE)
+                vkDestroySwapchainKHR(device, retired.swapchain, nullptr);
+        }
+        retired_swapchains.clear();
+    }
+
+    void reclaim_retired_swapchains()
+    {
+        auto it = retired_swapchains.begin();
+        while (it != retired_swapchains.end())
+        {
+            bool complete = true;
+            for (const frame_sync_t& sync : it->frame_sync)
+            {
+                VkResult result = vkGetFenceStatus(device, sync.recycle_fence);
+                if (result == VK_NOT_READY)
+                {
+                    complete = false;
+                    break;
+                }
+                /* A device error is handled by the next rendering operation.
+                 * Do not destroy resources that may still be referenced. */
+                if (result != VK_SUCCESS)
+                {
+                    complete = false;
+                    break;
+                }
+            }
+            if (!complete)
+            {
+                ++it;
+                continue;
+            }
+
+            destroy_frame_sync(&it->frame_sync);
+            it->skia_surfaces.clear();
+            it->images.clear();
+            if (it->swapchain != VK_NULL_HANDLE)
+                vkDestroySwapchainKHR(device, it->swapchain, nullptr);
+            it = retired_swapchains.erase(it);
+        }
     }
 
     bool create_frame_sync(char *error, size_t error_size)
@@ -599,6 +670,13 @@ struct awesome_skia_renderer
             set_error(error, error_size, "Cannot create a zero-sized swapchain");
             return false;
         }
+        if (active_frame)
+        {
+            set_error(error, error_size, "Cannot resize while a Skia frame is active");
+            return false;
+        }
+
+        reclaim_retired_swapchains();
 
         VkSurfaceCapabilitiesKHR capabilities = {};
         VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -669,21 +747,18 @@ struct awesome_skia_renderer
             return false;
         }
 
-        /* A swapchain owns its synchronisation objects. Recreate only between
-         * frames, then wait once before releasing the old resources. Normal
-         * rendering never waits for the GPU on the CPU. */
-        if (active_frame)
-        {
-            set_error(error, error_size, "Cannot resize while a Skia frame is active");
-            vkDestroySwapchainKHR(device, new_swapchain, nullptr);
-            return false;
-        }
-        vkDeviceWaitIdle(device);
-        destroy_frame_sync();
-        skia_surfaces.clear();
-        images.clear();
-        if (swapchain != VK_NULL_HANDLE)
-            vkDestroySwapchainKHR(device, swapchain, nullptr);
+        /* Never wait for the whole device during an animated resize. The old
+         * swapchain and its binary semaphores remain alive until the fence
+         * submitted after their last present signals; oldSwapchain lets the
+         * driver transfer presentation resources efficiently in the meantime.
+         */
+        retired_swapchain_t retired;
+        retired.swapchain = swapchain;
+        retired.images = std::move(images);
+        retired.skia_surfaces = std::move(skia_surfaces);
+        retired.frame_sync = std::move(frame_sync);
+        if (retired.swapchain != VK_NULL_HANDLE)
+            retired_swapchains.push_back(std::move(retired));
 
         swapchain = new_swapchain;
         swapchain_format = surface_format.format;
@@ -692,6 +767,7 @@ struct awesome_skia_renderer
         composite_alpha = create_info.compositeAlpha;
         requested_width = width;
         requested_height = height;
+        next_sync = 0;
 
         uint32_t swapchain_image_count = 0;
         result = vkGetSwapchainImagesKHR(device, swapchain,
@@ -775,6 +851,8 @@ struct awesome_skia_renderer
             return nullptr;
         }
 
+        reclaim_retired_swapchains();
+
         const size_t sync_index = next_sync;
         frame_sync_t& sync = frame_sync[sync_index];
         VkResult result = vkWaitForFences(device, 1, &sync.recycle_fence,
@@ -825,6 +903,12 @@ struct awesome_skia_renderer
         frame->renderer = this;
         frame->canvas = skia_surfaces[image_index]->getCanvas();
         frame->surface = skia_surfaces[image_index].get();
+        /* A swapchain SkSurface reuses its SkCanvas across acquisitions.
+         * Root-level clips and transforms must be scoped to one presentation;
+         * otherwise an opening popup's initially reduced clip permanently
+         * masks the newly revealed rows on this swapchain image. */
+        frame->canvas_restore_count = frame->canvas->getSaveCount();
+        frame->canvas->save();
         frame->image_index = image_index;
         frame->sync_index = sync_index;
         active_frame = frame.get();
@@ -840,6 +924,7 @@ struct awesome_skia_renderer
             return false;
         }
         active_frame = nullptr;
+        frame->canvas->restoreToCount(frame->canvas_restore_count);
         frame_sync_t& sync = frame_sync[frame->sync_index];
 
         GrBackendSemaphore render_semaphore =
@@ -953,6 +1038,7 @@ struct awesome_skia_renderer
 
         skia_surfaces.clear();
         images.clear();
+        destroy_retired_swapchains();
         skia_context.reset();
 
         if (swapchain != VK_NULL_HANDLE)

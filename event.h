@@ -42,8 +42,11 @@ void client_destroy_later(void);
 static inline int
 awesome_refresh(void)
 {
-    luaA_emit_refresh();
+    /* Apply every geometry assignment accumulated during this main-loop turn
+     * before delayed wibox redraws consume it. This turns a Lua assignment
+     * sequence such as width/height/x/y into one X ConfigureWindow request. */
     drawin_refresh();
+    luaA_emit_refresh();
     client_refresh();
     banning_refresh();
     stack_refresh();

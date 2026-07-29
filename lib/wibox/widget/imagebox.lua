@@ -199,6 +199,11 @@ function imagebox:draw(ctx, cr, width, height)
         pat:set_extend(pol)
         cr:set_source(pat)
         cr:paint()
+    elseif skia.is_svg and skia.is_svg(self._private.image) then
+        -- Keep SVGs vector-native through imagebox's final transform.  The
+        -- DOM is rendered by Skia directly into the Vulkan canvas instead of
+        -- being rasterised at its nominal 24/48px size and scaled afterward.
+        cr:draw_svg(self._private.image, 0, 0)
     else
         cr:draw_image(self._private.image, 0, 0)
     end
@@ -278,11 +283,7 @@ function imagebox:set_image(image)
     if type(image) == "string" then
         local loaded
         if image:lower():match("%.svg$") then
-            local width, height = skia.svg_dimensions(image)
-            if width and height then
-                loaded = skia.load_svg(image, math.ceil(width), math.ceil(height),
-                    self._private.stylesheet)
-            end
+            loaded = skia.load_svg_dom(image, self._private.stylesheet)
         else
             loaded = surface.load_silently(image)
         end

@@ -73,6 +73,9 @@ constexpr const char *k_frame_type = "awesome.skia.frame";
 constexpr const char *k_pattern_type = "awesome.skia.pattern";
 constexpr const char *k_image_type = "awesome.skia.image";
 constexpr const char *k_surface_type = "awesome.skia.surface";
+#ifdef AWESOME_SKIA_HAS_SVG
+constexpr const char *k_svg_type = "awesome.skia.svg";
+#endif
 
 std::unordered_map<std::string, sk_sp<SkImage>> encoded_images;
 
@@ -113,21 +116,43 @@ std::string css_value(const char *stylesheet, const char *property)
     if (!stylesheet)
         return {};
     const std::string css(stylesheet);
-    const size_t property_pos = css.find(property);
-    if (property_pos == std::string::npos)
-        return {};
-    const size_t colon = css.find(':', property_pos + std::strlen(property));
-    if (colon == std::string::npos)
-        return {};
-    size_t begin = colon + 1;
-    while (begin < css.size() && std::isspace(static_cast<unsigned char>(css[begin])))
-        ++begin;
-    size_t end = begin;
-    while (end < css.size() && css[end] != ';' && css[end] != '}')
-        ++end;
-    while (end > begin && std::isspace(static_cast<unsigned char>(css[end - 1])))
-        --end;
-    return css.substr(begin, end - begin);
+    const std::string name(property);
+    size_t position = 0;
+    while ((position = css.find(name, position)) != std::string::npos)
+    {
+        const bool valid_before = position == 0 ||
+            !(std::isalnum(static_cast<unsigned char>(css[position - 1])) ||
+              css[position - 1] == '-' || css[position - 1] == '_');
+        const size_t after = position + name.size();
+        const bool valid_after = after >= css.size() ||
+            !(std::isalnum(static_cast<unsigned char>(css[after])) ||
+              css[after] == '-' || css[after] == '_');
+        if (!valid_before || !valid_after)
+        {
+            position = after;
+            continue;
+        }
+
+        size_t colon = after;
+        while (colon < css.size() && std::isspace(static_cast<unsigned char>(css[colon])))
+            ++colon;
+        if (colon >= css.size() || css[colon] != ':')
+        {
+            position = after;
+            continue;
+        }
+
+        size_t begin = colon + 1;
+        while (begin < css.size() && std::isspace(static_cast<unsigned char>(css[begin])))
+            ++begin;
+        size_t end = begin;
+        while (end < css.size() && css[end] != ';' && css[end] != '}')
+            ++end;
+        while (end > begin && std::isspace(static_cast<unsigned char>(css[end - 1])))
+            --end;
+        return css.substr(begin, end - begin);
+    }
+    return {};
 }
 
 void override_svg_attribute(std::string *svg, const char *attribute, const std::string &value)
@@ -166,6 +191,9 @@ std::string styled_svg(const char *path, const char *stylesheet)
     std::string svg(static_cast<const char *>(data->data()), data->size());
     override_svg_attribute(&svg, "fill", css_value(stylesheet, "fill"));
     override_svg_attribute(&svg, "stroke", css_value(stylesheet, "stroke"));
+    override_svg_attribute(&svg, "fill-opacity", css_value(stylesheet, "fill-opacity"));
+    override_svg_attribute(&svg, "stroke-opacity", css_value(stylesheet, "stroke-opacity"));
+    override_svg_attribute(&svg, "opacity", css_value(stylesheet, "opacity"));
     return svg;
 }
 
@@ -217,6 +245,18 @@ struct lua_skia_image
 {
     sk_sp<SkImage> image;
 };
+
+#ifdef AWESOME_SKIA_HAS_SVG
+/* An SVG retained as a DOM, rather than a CPU-rasterised image.  imagebox
+ * uses this when it can draw straight into a Vulkan-backed canvas, so icons
+ * stay vector graphics until their final on-screen transform is known. */
+struct lua_skia_svg
+{
+    sk_sp<SkSVGDOM> dom;
+    int width = 0;
+    int height = 0;
+};
+#endif
 
 /* A drawing target, mirroring cairo_surface_t. One of three things backs it:
  *
@@ -313,6 +353,33 @@ lua_skia_image *test_image(lua_State *L, int index)
     lua_pop(L, 2);
     return matches ? static_cast<lua_skia_image *>(lua_touserdata(L, index)) : nullptr;
 }
+
+#ifdef AWESOME_SKIA_HAS_SVG
+lua_skia_svg *test_svg(lua_State *L, int index)
+{
+    if (!lua_isuserdata(L, index) || !lua_getmetatable(L, index))
+        return nullptr;
+    luaL_getmetatable(L, k_svg_type);
+    const bool matches = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);
+    return matches ? static_cast<lua_skia_svg *>(lua_touserdata(L, index)) : nullptr;
+}
+
+lua_skia_svg *push_svg(lua_State *L)
+{
+    void *storage = lua_newuserdata(L, sizeof(lua_skia_svg));
+    auto *svg = new (storage) lua_skia_svg;
+    luaL_getmetatable(L, k_svg_type);
+    lua_setmetatable(L, -2);
+    return svg;
+}
+
+int skia_is_svg(lua_State *L)
+{
+    lua_pushboolean(L, test_svg(L, 1) != nullptr);
+    return 1;
+}
+#endif
 
 int skia_is_image(lua_State *L)
 {
@@ -423,7 +490,7 @@ void refresh_gradient(lua_skia_pattern *pattern)
         if (pattern->image)
             pattern->shader = pattern->image->makeShader(
                 pattern->tile_mode, pattern->tile_mode,
-                SkSamplingOptions(SkFilterMode::kLinear),
+                SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear),
                 pattern->has_local_matrix ? &pattern->local_matrix : nullptr);
         return;
     }
@@ -651,7 +718,7 @@ int frame_set_source_surface(lua_State *L)
     frame->state.paint.setColor(SK_ColorBLACK);
     frame->state.paint.setShader(image->makeShader(
         SkTileMode::kDecal, SkTileMode::kDecal,
-        SkSamplingOptions(SkFilterMode::kLinear),
+        SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear),
         SkMatrix::Translate(x, y)));
     return 0;
 }
@@ -750,6 +817,53 @@ int frame_transform_matrix(lua_State *L)
                   0, 0, 1);
     canvas(frame)->concat(matrix);
     return 0;
+}
+
+/* cairo.Matrix field layout: x_new = xx*x + xy*y + x0, y_new = yx*x + yy*y + y0
+ * Skia's SkMatrix: x' = scaleX*x + skewX*y + transX, y' = skewY*x + scaleY*y + transY
+ * so xx<->scaleX, xy<->skewX, x0<->transX, yx<->skewY, yy<->scaleY, y0<->transY
+ * (the exact inverse of the field mapping frame_transform_matrix uses above). */
+/* Pushes a real gears.matrix instance (not a plain field table): callers use
+ * OOP methods like :transform_point()/:transform_rectangle() on it, which
+ * need gears.matrix's metatable, not just the xx/yx/xy/yy/x0/y0 fields. */
+void push_matrix_table(lua_State *L, const SkMatrix &m)
+{
+    lua_getglobal(L, "require");
+    lua_pushliteral(L, "gears.matrix");
+    lua_call(L, 1, 1);
+    lua_getfield(L, -1, "create");
+    lua_pushnumber(L, m.getScaleX());
+    lua_pushnumber(L, m.getSkewY());
+    lua_pushnumber(L, m.getSkewX());
+    lua_pushnumber(L, m.getScaleY());
+    lua_pushnumber(L, m.getTranslateX());
+    lua_pushnumber(L, m.getTranslateY());
+    lua_call(L, 6, 1);
+    lua_remove(L, -2);
+}
+
+/* cr:get_matrix() -- cairo_get_matrix(): the current transformation matrix. */
+int frame_get_matrix(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    push_matrix_table(L, canvas(frame)->getTotalMatrix());
+    return 1;
+}
+
+/* cr:user_to_device_distance(dx, dy) -- transforms a distance vector (the
+ * translation part of the CTM does not apply to a distance). */
+int frame_user_to_device_distance(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    SkMatrix m = canvas(frame)->getTotalMatrix();
+    m[SkMatrix::kMTransX] = 0;
+    m[SkMatrix::kMTransY] = 0;
+    SkPoint pt = SkPoint::Make(static_cast<SkScalar>(luaL_checknumber(L, 2)),
+                              static_cast<SkScalar>(luaL_checknumber(L, 3)));
+    m.mapPoints(SkSpan<SkPoint>(&pt, 1));
+    lua_pushnumber(L, pt.x());
+    lua_pushnumber(L, pt.y());
+    return 2;
 }
 
 int frame_clip(lua_State *L)
@@ -1119,7 +1233,7 @@ int frame_pop_group_to_source(lua_State *L)
 
     frame->state.paint.setShader(layer.surface->makeImageSnapshot()->makeShader(
         SkTileMode::kClamp, SkTileMode::kClamp,
-        SkSamplingOptions(SkFilterMode::kLinear), &local_matrix));
+        SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear), &local_matrix));
     return 0;
 }
 
@@ -1245,15 +1359,15 @@ sk_sp<SkTypeface> typeface_for_pango_font(PangoFont *font)
     if (sk_sp<SkFontMgr> manager = font_manager())
     {
         /* Fontconfig stores a named variable-font instance in the high bits
-         * of FC_INDEX.  Skia expects only the collection-face index there;
+         * of FC_INDEX. Skia expects only the collection-face index there;
          * passing the packed value selected the default face and silently
          * lost Pango's requested weight. */
         typeface = manager->makeFromFile(reinterpret_cast<const char *>(file), index & 0xffff);
         if (typeface)
         {
+            const float pango_weight = static_cast<float>(FcWeightToOpenType(weight));
             const SkFontArguments::VariationPosition::Coordinate coordinates[] = {
-                {SkFontArguments::VariationPosition::Coordinate::wght,
-                 static_cast<float>(FcWeightToOpenType(weight))},
+                {SkFontArguments::VariationPosition::Coordinate::wght, pango_weight},
             };
             SkFontArguments arguments;
             arguments.setVariationDesignPosition({coordinates, 1});
@@ -1454,9 +1568,34 @@ int frame_draw_image(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
     sk_sp<SkImage> image = check_drawable_image(L, 2);
-    canvas(frame)->drawImage(image, luaL_optnumber(L, 3, 0), luaL_optnumber(L, 4, 0));
+    /* Bilinear alone (no mipmaps) only samples the 4 nearest texels per
+     * output pixel: for any real minification (e.g. an avatar decoded at
+     * source resolution and drawn at icon size) that aliases just as badly
+     * as nearest-neighbour, since most of the source is skipped between
+     * samples. Mipmapping is required for the downscale to actually blend an
+     * averaged area instead. */
+    canvas(frame)->drawImage(image, luaL_optnumber(L, 3, 0), luaL_optnumber(L, 4, 0),
+                             SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kLinear));
     return 0;
 }
+
+#ifdef AWESOME_SKIA_HAS_SVG
+/* Render an SVG at the canvas' current transform.  The caller (imagebox)
+ * has already established its final scale and clipping, so this keeps both
+ * the SVG geometry and its antialiasing on the GPU until presentation. */
+int frame_draw_svg(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    lua_skia_svg *svg = test_svg(L, 2);
+    if (!svg || !svg->dom)
+        return luaL_argerror(L, 2, "expected a Skia SVG");
+
+    SkAutoCanvasRestore restore(canvas(frame), true);
+    canvas(frame)->translate(luaL_optnumber(L, 3, 0), luaL_optnumber(L, 4, 0));
+    svg->dom->render(canvas(frame));
+    return 0;
+}
+#endif
 
 int skia_image_dimensions(lua_State *L)
 {
@@ -1613,6 +1752,48 @@ int skia_surface_from_bgra(lua_State *L)
 }
 
 #ifdef AWESOME_SKIA_HAS_SVG
+/* skia.load_svg_dom(path[, stylesheet]) -- retain a vector SVG for direct
+ * canvas rendering.  This is deliberately separate from load_svg(), whose
+ * raster surface result remains useful to generic Cairo-shaped APIs. */
+int skia_load_svg_dom(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    const char *stylesheet = luaL_optstring(L, 2, nullptr);
+    const std::string source = styled_svg(path, stylesheet);
+    if (source.empty())
+    {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not open SVG '%s'", path);
+        return 2;
+    }
+
+    SkMemoryStream stream(source.data(), source.size(), false);
+    sk_sp<SkSVGDOM> dom = SkSVGDOM::MakeFromStream(stream);
+    if (!dom)
+    {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not parse SVG '%s'", path);
+        return 2;
+    }
+
+    SkSize size = dom->containerSize();
+    float width = size.width();
+    float height = size.height();
+    if ((width <= 0 || height <= 0) && !svg_intrinsic_size(path, &width, &height))
+    {
+        lua_pushnil(L);
+        lua_pushfstring(L, "could not determine SVG dimensions for '%s'", path);
+        return 2;
+    }
+    dom->setContainerSize(SkSize::Make(width, height));
+
+    lua_skia_svg *svg = push_svg(L);
+    svg->dom = std::move(dom);
+    svg->width = static_cast<int>(std::ceil(width));
+    svg->height = static_cast<int>(std::ceil(height));
+    return 1;
+}
+
 /* skia.svg_dimensions(path) -- the SVG's intrinsic size (from its width/
  * height or viewBox), before any target size is chosen. Mirrors what
  * Rsvg.Handle:get_dimensions() gave callers under Cairo. */
@@ -1687,7 +1868,43 @@ int skia_load_svg(lua_State *L)
     surface->height = height;
     return 1;
 }
+
+int svg_get_width(lua_State *L)
+{
+    lua_pushinteger(L, static_cast<lua_skia_svg *>(
+        luaL_checkudata(L, 1, k_svg_type))->width);
+    return 1;
+}
+
+int svg_get_height(lua_State *L)
+{
+    lua_pushinteger(L, static_cast<lua_skia_svg *>(
+        luaL_checkudata(L, 1, k_svg_type))->height);
+    return 1;
+}
+
+int svg_gc(lua_State *L)
+{
+    auto *svg = static_cast<lua_skia_svg *>(luaL_checkudata(L, 1, k_svg_type));
+    svg->~lua_skia_svg();
+    return 0;
+}
+
+int svg_index(lua_State *L)
+{
+    luaL_getmetatable(L, k_svg_type);
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);
+    return 1;
+}
 #else
+int skia_load_svg_dom(lua_State *L)
+{
+    lua_pushnil(L);
+    lua_pushliteral(L, "this Skia build was linked without the SVG module");
+    return 2;
+}
+
 int skia_svg_dimensions(lua_State *L)
 {
     lua_pushnil(L);
@@ -1888,6 +2105,11 @@ int frame_index(lua_State *L)
     if (std::strcmp(name, "status") == 0)
     {
         lua_pushliteral(L, "SUCCESS");
+        return 1;
+    }
+    if (std::strcmp(name, "matrix") == 0)
+    {
+        push_matrix_table(L, canvas(check_frame(L, 1))->getTotalMatrix());
         return 1;
     }
     lua_pushnil(L);
@@ -2303,6 +2525,8 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "scale", frame_scale);
     set_method(L, "rotate", frame_rotate);
     set_method(L, "transform_matrix", frame_transform_matrix);
+    set_method(L, "get_matrix", frame_get_matrix);
+    set_method(L, "user_to_device_distance", frame_user_to_device_distance);
     /* Cairo spelling. A gears.matrix instance carries the same
      * xx/yx/xy/yy/x0/y0 fields, so it is accepted without conversion. */
     set_method(L, "transform", frame_transform_matrix);
@@ -2343,6 +2567,9 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "show_text", frame_show_text);
     set_method(L, "show_layout", frame_show_layout);
     set_method(L, "draw_image", frame_draw_image);
+#ifdef AWESOME_SKIA_HAS_SVG
+    set_method(L, "draw_svg", frame_draw_svg);
+#endif
     set_method(L, "snapshot", frame_snapshot);
     lua_pop(L, 1);
 
@@ -2354,6 +2581,15 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "get_width", image_get_width);
     set_method(L, "get_height", image_get_height);
     lua_pop(L, 1);
+
+#ifdef AWESOME_SKIA_HAS_SVG
+    luaL_newmetatable(L, k_svg_type);
+    set_method(L, "__gc", svg_gc);
+    set_method(L, "__index", svg_index);
+    set_method(L, "get_width", svg_get_width);
+    set_method(L, "get_height", svg_get_height);
+    lua_pop(L, 1);
+#endif
 
     luaL_newmetatable(L, k_pattern_type);
     set_method(L, "__gc", pattern_gc);
@@ -2436,10 +2672,17 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "begin", frame_begin);
     set_method(L, "is_canvas", skia_is_canvas);
     set_method(L, "is_image", skia_is_image);
+#ifdef AWESOME_SKIA_HAS_SVG
+    set_method(L, "is_svg", skia_is_svg);
+#else
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "is_svg");
+#endif
     set_method(L, "image_dimensions", skia_image_dimensions);
     set_method(L, "new_image_surface", skia_new_image_surface);
     set_method(L, "load_image", skia_load_image);
     set_method(L, "load_svg", skia_load_svg);
+    set_method(L, "load_svg_dom", skia_load_svg_dom);
     set_method(L, "svg_dimensions", skia_svg_dimensions);
     lua_newtable(L);
     set_method(L, "create_rgba", pattern_create_rgba);

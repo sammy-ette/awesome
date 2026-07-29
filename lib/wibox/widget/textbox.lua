@@ -35,9 +35,7 @@ local function setup_dpi(box, dpi)
     if box._private.dpi ~= dpi then
         box._private.dpi = dpi
         if box._private.font_map then
-            -- PangoFT2 keeps resolution on its font map, unlike PangoCairo's
-            -- context. Calling Context:set_resolution silently prevented every
-            -- Skia textbox from reaching its draw step.
+            -- PangoFT2 keeps resolution on its font map.
             box._private.font_map:set_resolution(dpi, dpi)
         else
             box._private.ctx:set_resolution(dpi)

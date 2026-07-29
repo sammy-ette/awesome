@@ -213,9 +213,7 @@ drawin_update_drawing(lua_State *L, int widx)
      * as a sliver. */
     drawin_apply_moveresize(w);
     xcb_aux_sync(globalconf.connection);
-    luaA_object_push_item(L, widx, w->drawable);
-    drawable_set_geometry(L, -1, w->geometry);
-    lua_pop(L, 1);
+    drawable_ensure_renderer(w->drawable);
 }
 
 /** Refresh the window content by copying its pixmap data to its window.
@@ -295,7 +293,12 @@ drawin_moveresize(lua_State *L, int udx, area_t geometry)
         w->geometry.height = old_geometry.height;
 
     w->geometry_dirty = true;
-    drawin_update_drawing(L, udx);
+    /* Keep Lua's drawable geometry current so property signals and wibox
+     * layout can coalesce this frame. X configuration and Vulkan swapchain
+     * recreation happen once later, immediately before the redraw. */
+    luaA_object_push_item(L, udx, w->drawable);
+    drawable_set_geometry(L, -1, w->geometry);
+    lua_pop(L, 1);
 
     if (!AREA_EQUAL(old_geometry, w->geometry))
         luaA_object_emit_signal(L, udx, "property::geometry", 0);
@@ -465,11 +468,49 @@ drawin_allocator(lua_State *L)
                           globalconf.default_cmap,
                           xcursor_new(&globalconf.cursor_cache, globalconf.cursor_ctx, w->cursor)
                       });
-    drawable_allocator(L, (drawable_refresh_callback *) drawin_refresh_pixmap, w,
-                       w->window);
+
+    /* Present Skia into a mapped child. The outer drawin remains the public
+     * window whose geometry, shape and input region Lua controls; X clips the
+     * child to those animated bounds. The child can therefore retain the
+     * largest Vulkan swapchain instead of rebuilding it on every size tick. */
+    xcb_window_t presentation_window = xcb_generate_id(globalconf.connection);
+    xcb_create_window(globalconf.connection, globalconf.default_depth,
+                      presentation_window, w->window,
+                      0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                      globalconf.visual->visual_id,
+                      XCB_CW_BACK_PIXMAP | XCB_CW_BIT_GRAVITY | XCB_CW_COLORMAP,
+                      (const uint32_t []) {
+                          XCB_NONE,
+                          XCB_GRAVITY_NORTH_WEST,
+                          globalconf.default_cmap
+                      });
+
+    drawable_t *drawable = drawable_allocator(
+        L, (drawable_refresh_callback *) drawin_refresh_pixmap, w,
+        presentation_window);
+    drawable->skia_stable_backing = true;
     w->drawable = luaA_object_ref_item(L, -2, -1);
-    if (globalconf.is_compositing)
+    if (globalconf.is_compositing) {
         xcb_composite_redirect_subwindows(globalconf.connection, w->window, XCB_COMPOSITE_REDIRECT_MANUAL);
+        /* Systray children remain redirected; the Skia presentation child
+         * must reach the screen directly. */
+        xcb_composite_unredirect_window(globalconf.connection,
+                                        presentation_window,
+                                        XCB_COMPOSITE_REDIRECT_MANUAL);
+        /* Automatic redirection gives the retained presentation child an
+         * off-screen backing pixmap. Without it, rows clipped by the smaller
+         * parent during an opening transition have undefined contents when
+         * they are exposed later, even though the Vulkan swapchain itself is
+         * full-sized. */
+        xcb_composite_redirect_window(globalconf.connection,
+                                      presentation_window,
+                                      XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    }
+    if (globalconf.have_input_shape)
+        xcb_shape_rectangles(globalconf.connection, XCB_SHAPE_SO_SET,
+                             XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED,
+                             presentation_window, 0, 0, 0, NULL);
+    xcb_map_window(globalconf.connection, presentation_window);
     xwindow_set_class_instance(w->window);
     xwindow_set_name_static(w->window, "Awesome drawin");
 

@@ -122,7 +122,10 @@ function overflow:layout(context, orig_width, orig_height)
 
     local need_scrollbar = used_in_dir > avail_in_dir and scrollbar_enabled
 
-    local scroll_position = self._private.scroll_factor
+    -- A scrollbar-free overflow can keep its child geometry fixed and apply
+    -- scrolling as a draw transform. The scrollbar path still lays out the
+    -- handle at the current factor, so its hit geometry remains exact.
+    local scroll_position = scrollbar_enabled and self._private.scroll_factor or 0
 
     if need_scrollbar then
         local scrollbar_widget = self._private.scrollbar_widget
@@ -193,8 +196,10 @@ function overflow:layout(context, orig_width, orig_height)
         -- When scrolling down, the content itself moves up -> substract
         local scrolled_pos = pos - (scroll_position * interval)
 
-        -- Stop processing completely once we're passed the visible portion
-        if scrolled_pos > avail_in_dir then
+        -- With a scrollbar, omit children outside the viewport as before. In
+        -- the transform fast path keep every child in the hierarchy: its
+        -- cached placement is stable while the canvas translation moves it.
+        if scrollbar_enabled and scrolled_pos > avail_in_dir then
             break
         end
 
@@ -214,9 +219,9 @@ function overflow:layout(context, orig_width, orig_height)
             end
         end
 
-        local is_in_view = is_y
-                           and (scrolled_pos + content_h > 0)
-                           or (scrolled_pos + content_w > 0)
+        local is_in_view = not scrollbar_enabled
+                           or (is_y and (scrolled_pos + content_h > 0)
+                               or (scrolled_pos + content_w > 0))
 
         if is_in_view then
             -- Add the spacing widget, but not before the first widget
@@ -253,8 +258,27 @@ end
 
 function overflow:before_draw_children(_, cr, width, height)
     -- Clip drawing for children to the space we're allowed to draw in
+    if not self._private.scrollbar_enabled then
+        cr:save()
+    end
     cr:rectangle(0, 0, width, height)
     cr:clip()
+    if not self._private.scrollbar_enabled then
+        local interval = math.max(0,
+            self._private.used_in_dir - self._private.avail_in_dir)
+        local offset = self._private.scroll_factor * interval
+        if self._private.dir == "y" then
+            cr:translate(0, -offset)
+        else
+            cr:translate(-offset, 0)
+        end
+    end
+end
+
+function overflow:after_draw_children(_, cr)
+    if not self._private.scrollbar_enabled then
+        cr:restore()
+    end
 end
 
 
@@ -323,7 +347,11 @@ function overflow:set_scroll_factor(factor)
 
     self._private.scroll_factor = math.min(1, math.max(factor, 0))
 
-    self:emit_signal("widget::layout_changed")
+    if self._private.scrollbar_enabled then
+        self:emit_signal("widget::layout_changed")
+    else
+        self:emit_signal("widget::redraw_needed")
+    end
     self:emit_signal("property::scroll_factor", factor)
 end
 

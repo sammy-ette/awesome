@@ -29,7 +29,10 @@
 
 #include "drawable.h"
 #include "common/luaobject.h"
+#include "common/xutil.h"
 #include "globalconf.h"
+
+#include <xcb/xcb_aux.h>
 
 /** Drawable object.
  *
@@ -112,6 +115,11 @@ drawable_allocator(lua_State *L, drawable_refresh_callback *callback, void *data
     d->refreshed = false;
     d->pixmap = XCB_NONE;
     d->skia_renderer = NULL;
+    d->skia_renderer_width = 0;
+    d->skia_renderer_height = 0;
+    d->skia_capacity_width = 0;
+    d->skia_capacity_height = 0;
+    d->skia_stable_backing = false;
     d->presentation_window = presentation_window;
     return d;
 }
@@ -122,6 +130,10 @@ drawable_unset_surface(drawable_t *d)
     if (d->skia_renderer)
         awesome_skia_renderer_destroy(d->skia_renderer);
     d->skia_renderer = NULL;
+    d->skia_renderer_width = 0;
+    d->skia_renderer_height = 0;
+    d->skia_capacity_width = 0;
+    d->skia_capacity_height = 0;
     if (d->pixmap)
         xcb_free_pixmap(globalconf.connection, d->pixmap);
     d->refreshed = false;
@@ -135,43 +147,95 @@ drawable_wipe(drawable_t *d)
 }
 
 void
+drawable_ensure_renderer(drawable_t *d)
+{
+    if (d->geometry.width <= 0 || d->geometry.height <= 0)
+        return;
+    if (d->presentation_window == XCB_NONE)
+        fatal("Skia drawable has no XCB presentation window");
+    const uint16_t target_width = d->skia_stable_backing
+                                ? d->skia_capacity_width : d->geometry.width;
+    const uint16_t target_height = d->skia_stable_backing
+                                 ? d->skia_capacity_height : d->geometry.height;
+    if (d->skia_renderer && d->skia_renderer_width == target_width &&
+        d->skia_renderer_height == target_height)
+        return;
+
+    /* A drawin's presentation child grows to its largest requested size but
+     * never shrinks. Its logical parent clips it while the popup animates, so
+     * Vulkan sees a stable native window and no per-frame swapchain rebuild.
+     * Client titlebars continue to resize their presentation window normally.
+     */
+    if (d->skia_stable_backing)
+        xcb_configure_window(globalconf.connection, d->presentation_window,
+                             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                             (const uint32_t []) { target_width, target_height });
+
+    /* Ensure the final native size is visible to X11 WSI before creating or
+     * growing the swapchain. This occurs once per new capacity, not once per
+     * animation frame. */
+    xcb_aux_sync(globalconf.connection);
+    char error[256] = {0};
+    if (d->skia_renderer) {
+        if (!awesome_skia_renderer_resize(d->skia_renderer,
+                                          target_width, target_height,
+                                          error, sizeof(error)))
+            fatal("Could not resize Skia/Vulkan drawable renderer: %s", error);
+    } else {
+        d->skia_renderer = awesome_skia_renderer_create(
+            globalconf.connection, d->presentation_window,
+            target_width, target_height, error, sizeof(error));
+        if (!d->skia_renderer)
+            fatal("Could not create required Skia/Vulkan drawable renderer: %s", error);
+    }
+    d->skia_renderer_width = target_width;
+    d->skia_renderer_height = target_height;
+}
+
+void
 drawable_set_geometry(lua_State *L, int didx, area_t geom)
 {
     drawable_t *d = luaA_checkudata(L, didx, &drawable_class);
     area_t old = d->geometry;
-    d->geometry = geom;
-
-    bool area_changed = !AREA_EQUAL(old, geom);
-    if (area_changed)
-        drawable_unset_surface(d);
-    if (area_changed && geom.width > 0 && geom.height > 0)
-    {
-        if (d->presentation_window == XCB_NONE)
-            fatal("Skia drawable has no XCB presentation window");
-
-        char error[256] = {0};
-        d->skia_renderer = awesome_skia_renderer_create(
-            globalconf.connection, d->presentation_window,
-            geom.width, geom.height, error, sizeof(error));
-        if (!d->skia_renderer)
-            fatal("Could not create required Skia/Vulkan drawable renderer: %s", error);
+    if (d->skia_stable_backing) {
+        d->skia_capacity_width = MAX(d->skia_capacity_width, geom.width);
+        d->skia_capacity_height = MAX(d->skia_capacity_height, geom.height);
+        /* The outer drawin owns the animated logical bounds. Its presentation
+         * child and widget hierarchy retain the largest size, so moving or
+         * revealing a popup is an X clip/configure operation rather than a
+         * Pango relayout and full Skia repaint on every tick. Keep x/y current
+         * for screen lookup but do not signal redraws for position-only moves.
+         */
+        d->geometry = (area_t) {
+            .x = geom.x,
+            .y = geom.y,
+            .width = d->skia_capacity_width,
+            .height = d->skia_capacity_height
+        };
+    } else {
+        d->skia_capacity_width = geom.width;
+        d->skia_capacity_height = geom.height;
+        d->geometry = geom;
     }
+
+    const bool area_changed = !AREA_EQUAL(old, d->geometry);
 
     if (area_changed)
         luaA_object_emit_signal(L, didx, "property::geometry", 0);
-    if (old.x != geom.x)
+    if (!d->skia_stable_backing && old.x != d->geometry.x)
         luaA_object_emit_signal(L, didx, "property::x", 0);
-    if (old.y != geom.y)
+    if (!d->skia_stable_backing && old.y != d->geometry.y)
         luaA_object_emit_signal(L, didx, "property::y", 0);
-    if (old.width != geom.width)
+    if (old.width != d->geometry.width)
         luaA_object_emit_signal(L, didx, "property::width", 0);
-    if (old.height != geom.height)
+    if (old.height != d->geometry.height)
         luaA_object_emit_signal(L, didx, "property::height", 0);
 }
 
 static int
 luaA_drawable_get_skia_renderer(lua_State *L, drawable_t *drawable)
 {
+    drawable_ensure_renderer(drawable);
     if (drawable->skia_renderer)
         lua_pushlightuserdata(L, drawable->skia_renderer);
     else
