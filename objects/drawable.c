@@ -119,6 +119,8 @@ drawable_allocator(lua_State *L, drawable_refresh_callback *callback, void *data
     d->skia_renderer_height = 0;
     d->skia_capacity_width = 0;
     d->skia_capacity_height = 0;
+    d->skia_visible_width = 0;
+    d->skia_visible_height = 0;
     d->skia_stable_backing = false;
     d->presentation_window = presentation_window;
     return d;
@@ -197,6 +199,8 @@ drawable_set_geometry(lua_State *L, int didx, area_t geom)
 {
     drawable_t *d = luaA_checkudata(L, didx, &drawable_class);
     area_t old = d->geometry;
+    d->skia_visible_width = geom.width;
+    d->skia_visible_height = geom.height;
     if (d->skia_stable_backing) {
         d->skia_capacity_width = MAX(d->skia_capacity_width, geom.width);
         d->skia_capacity_height = MAX(d->skia_capacity_height, geom.height);
@@ -271,6 +275,18 @@ luaA_drawable_geometry(lua_State *L)
     return luaA_pusharea(L, d->geometry);
 }
 
+/* The logical geometry of an animated drawin is its largest backing size so
+ * layouts and its Vulkan swapchain remain stable. Expose the current outer
+ * bounds separately to the Skia drawable code for conservative root culling. */
+static int
+luaA_drawable_skia_visible_size(lua_State *L)
+{
+    drawable_t *d = luaA_checkudata(L, 1, &drawable_class);
+    lua_pushinteger(L, d->skia_visible_width);
+    lua_pushinteger(L, d->skia_visible_height);
+    return 2;
+}
+
 void
 drawable_class_setup(lua_State *L)
 {
@@ -286,6 +302,7 @@ drawable_class_setup(lua_State *L)
         LUA_CLASS_META
         { "refresh", luaA_drawable_refresh },
         { "geometry", luaA_drawable_geometry },
+        { "skia_visible_size", luaA_drawable_skia_visible_size },
         { NULL, NULL },
     };
 

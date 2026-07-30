@@ -1336,6 +1336,15 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
 
     L = globalconf.L.real_L_dont_use_directly = luaL_newstate();
 
+#if LUA_VERSION_NUM >= 504
+    /* Awesome keeps a large, long-lived widget/configuration graph while
+     * rendering creates many short-lived placement and signal tables. Lua
+     * 5.4's generational collector avoids repeatedly marking that old graph
+     * during animation frames. Older supported Lua versions retain their
+     * existing collector. */
+    lua_gc(L, LUA_GCGEN, 0, 0);
+#endif
+
     /* Set panic function */
     lua_atpanic(L, luaA_panic);
 

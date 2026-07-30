@@ -46,7 +46,7 @@ enable_language(CXX)
 
     # A static Skia archive intentionally leaves its platform dependencies to
     # the final consumer. These are the system libraries selected by the GN
-    # configuration in tools/bootstrap-skia-vulkan-probe.sh. Keep this list in
+    # configuration in tools/build-skia-vulkan.sh. Keep this list in
     # CMake instead of requiring callers to reverse-engineer linker errors via
     # SKIA_EXTRA_LIBRARIES.
     # Pango shapes the text (markup, wrapping, bidi); Skia draws the glyphs it
@@ -75,17 +75,16 @@ enable_language(CXX)
 
     if(NOT EXISTS "${SKIA_SOURCE_DIR}/include/core/SkCanvas.h")
         message(FATAL_ERROR
-            "Awesome requires SKIA_SOURCE_DIR to point at a Skia checkout")
+            "Awesome requires a Skia checkout. Build through the top-level Makefile, or set SKIA_SOURCE_DIR explicitly.")
     endif()
     if(NOT EXISTS "${SKIA_LIBRARY}")
         message(FATAL_ERROR
             "Awesome requires SKIA_LIBRARY to point at libskia.a")
     endif()
 
-    # Skia's SVG module (used to render SVG icons/images natively, replacing
-    # RSVG-over-Cairo) builds as separate static libraries alongside
-    # libskia.a. Link them when present; SVG loading just errors clearly at
-    # runtime otherwise, rather than failing the whole build.
+    # SVG is part of Awesome's rendering API: icons, imageboxes and themed CSS
+    # all depend on it. A Skia checkout without this complete static stack is
+    # not a valid Awesome dependency, so reject it during configuration.
     get_filename_component(SKIA_LIB_DIR "${SKIA_LIBRARY}" DIRECTORY)
     # Order matters for single-pass linkers: each entry may reference symbols
     # from the ones after it (svg -> skshaper/skresources -> skunicode_icu ->
@@ -93,24 +92,21 @@ enable_language(CXX)
     set(SKIA_SVG_CANDIDATE_LIBS
         libsvg.a libskshaper.a libskresources.a libskunicode_icu.a libskunicode_core.a)
     set(SKIA_SVG_LIBRARIES "")
-    set(AWESOME_SKIA_HAS_SVG TRUE)
     foreach(svg_lib ${SKIA_SVG_CANDIDATE_LIBS})
         if(EXISTS "${SKIA_LIB_DIR}/${svg_lib}")
             list(APPEND SKIA_SVG_LIBRARIES "${SKIA_LIB_DIR}/${svg_lib}")
         else()
-            set(AWESOME_SKIA_HAS_SVG FALSE)
+            message(FATAL_ERROR
+                "Awesome requires Skia SVG support, but ${SKIA_LIB_DIR}/${svg_lib} is missing. "
+                "Build Skia through the top-level Makefile.")
         endif()
     endforeach()
-    if(AWESOME_SKIA_HAS_SVG)
-        # libskunicode_icu.a needs the system ICU it was built against.
-        pkg_check_modules(SKIA_ICU icu-uc icu-i18n)
-        if(SKIA_ICU_FOUND)
-            list(APPEND SKIA_SVG_LIBRARIES ${SKIA_ICU_LDFLAGS})
-        else()
-            set(AWESOME_SKIA_HAS_SVG FALSE)
-            set(SKIA_SVG_LIBRARIES "")
-        endif()
+    # libskunicode_icu.a needs the system ICU it was built against.
+    pkg_check_modules(SKIA_ICU REQUIRED icu-uc icu-i18n)
+    if(NOT SKIA_ICU_FOUND)
+        message(FATAL_ERROR "Awesome requires ICU for Skia SVG support")
     endif()
+    list(APPEND SKIA_SVG_LIBRARIES ${SKIA_ICU_LDFLAGS})
 
     add_library(awesome-skia-renderer STATIC
         ${SOURCE_DIR}/render/skia/skia_backend.cc
@@ -125,12 +121,7 @@ enable_language(CXX)
             ${SKIA_PANGO_INCLUDE_DIRS})
     target_compile_definitions(awesome-skia-renderer
         PRIVATE VK_USE_PLATFORM_XCB_KHR)
-    if(AWESOME_SKIA_HAS_SVG)
-        target_compile_definitions(awesome-skia-renderer PRIVATE AWESOME_SKIA_HAS_SVG)
-    else()
-        message(STATUS "Skia SVG module libraries not found next to SKIA_LIBRARY; "
-            "SVG loading will be unavailable at runtime")
-    endif()
+    target_compile_definitions(awesome-skia-renderer PRIVATE AWESOME_SKIA_HAS_SVG)
     target_compile_options(awesome-skia-renderer
         PRIVATE -std=c++20 -Wall -Wextra -Wpedantic)
     target_link_libraries(awesome-skia-renderer

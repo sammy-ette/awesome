@@ -18,45 +18,32 @@ frame:present()
 `frame` is a GPU frame: it cannot be presented twice, and its garbage collector
 path closes an abandoned frame safely.
 
-## Lazy build
+## Build and install
 
 From the AwesomeWM repository, run:
 
 ```sh
-./tools/bootstrap-skia-vulkan-probe.sh --run
+make
+sudo make install
 ```
 
-The script performs the otherwise manual work:
+`make` clones and builds Skia under `build/_deps/`, configures Awesome against
+that exact checkout, and builds Awesome once. It does not use `$HOME/.cache`.
+`sudo make install` is install-only: it never downloads or builds dependencies
+as root.
 
-1. Clones `depot_tools` and Skia into the user cache directory.
-2. Synchronizes Skia's dependencies.
-3. Builds a static Vulkan-enabled Skia library.
-4. Configures and builds the GPU-enabled `awesome` executable and
-   `skia-vulkan-probe`.
-5. Runs the probe when `--run` is supplied.
-
-Nothing is installed. By default, downloads and build files stay under:
-
-```text
-${XDG_CACHE_HOME:-$HOME/.cache}/awesome-skia-probe
-```
-
-Useful controls:
+Useful controls for the local dependency checkout:
 
 ```sh
 # Re-fetch the selected Skia branch/tag/commit.
-SKIA_REF=main ./tools/bootstrap-skia-vulkan-probe.sh --update --run
+SKIA_REF=main tools/build-skia-vulkan.sh --update
 
 # Remove all downloaded and generated probe files.
-./tools/bootstrap-skia-vulkan-probe.sh --clean
-
-# Override parallelism or the cache location.
-JOBS=8 AWESOME_SKIA_CACHE_DIR=/tmp/awesome-skia \
-    ./tools/bootstrap-skia-vulkan-probe.sh --run
+tools/build-skia-vulkan.sh --clean
 ```
 
-The script does not use `sudo` or install distribution packages. Vulkan and XCB
-development headers, a C/C++ compiler, Git, Python, CMake, and pkg-config still
+The build helper does not use `sudo` or install distribution packages. Vulkan
+and XCB development headers, a C/C++ compiler, Git, Python, CMake, and pkg-config still
 need to exist on the system. The CMake target discovers the system libraries
 used by Skia's static archive (Fontconfig, FreeType, HarfBuzz, PNG, JPEG, WebP,
 Expat, and zlib) through pkg-config; they must have their development packages
@@ -79,7 +66,7 @@ ninja -C out/Release skia
 This prototype uses Skia's private Vulkan allocator factory because Skia does
 not expose a public factory for the allocator selected by its build. Therefore,
 the Skia source directory and `libskia.a` **must come from the same revision**.
-The bootstrap script guarantees that pairing, but the backend may still need
+The build helper guarantees that pairing, but the backend may still need
 adjustment if a newer Skia revision changes that private API. Set `SKIA_REF` to
 a known-working commit when reproducibility becomes important.
 
@@ -98,7 +85,7 @@ cmake --build build --target skia-vulkan-probe -j
 ./build/skia-vulkan-probe
 ```
 
-The bootstrap configuration links the libraries selected by its GN arguments
+The build configuration links the libraries selected by its GN arguments
 automatically. `SKIA_EXTRA_LIBRARIES` remains available only for an explicitly
 customized Skia build that needs additional libraries:
 

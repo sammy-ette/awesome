@@ -99,12 +99,19 @@ function systray:draw(context, cr, width, height)
         -- Solving the "width" formula above for "base" (with width=in_dir):
         base = (in_dir + spacing) / cols - spacing
     end
+    -- The core rounds the tray's native geometry up to whole X11 pixels.
+    -- Keep the capture dimensions identical. Passing the unrounded layout
+    -- value to `systray_surface` is invalid in Lua 5.4 and made every wibar
+    -- redraw throw while the tray was visible. Keep the public `systray`
+    -- call unchanged; its binding owns its established rounding semantics.
+    local pixel_base = math.ceil(base)
+    local pixel_spacing = math.ceil(spacing)
     capi.awesome.systray(context.wibox.drawin, math.ceil(x), math.ceil(y),
                          base, is_rotated, bg, reverse, spacing, rows)
 
     local surf_width, surf_height =
-        base * rows + spacing * (rows - 1),
-        base * cols + spacing * (cols - 1)
+        pixel_base * rows + pixel_spacing * (rows - 1),
+        pixel_base * cols + pixel_spacing * (cols - 1)
     if is_rotated then
         surf_width, surf_height = surf_height, surf_width
     end

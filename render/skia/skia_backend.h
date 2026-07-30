@@ -20,10 +20,29 @@ extern "C" {
 typedef struct awesome_skia_renderer awesome_skia_renderer_t;
 typedef struct awesome_skia_frame awesome_skia_frame_t;
 
+/** Aggregate timing for all live Skia renderers sharing the Vulkan device.
+ * Values are CPU wall-clock nanoseconds accumulated over window_nanoseconds.
+ * `record_nanoseconds` covers Lua/Skia command recording between begin_frame
+ * and end_frame; it is not a GPU timestamp. */
+typedef struct awesome_skia_timing_stats_t {
+    uint64_t frames;
+    uint64_t content_repaints;
+    uint64_t cache_replays;
+    uint64_t acquire_nanoseconds;
+    uint64_t record_nanoseconds;
+    uint64_t submit_nanoseconds;
+    uint64_t window_nanoseconds;
+} awesome_skia_timing_stats_t;
+
+/** Read shared timing counters. When reset is true, start a fresh interval
+ * immediately after producing this snapshot. */
+bool awesome_skia_get_timing_stats(awesome_skia_timing_stats_t *stats, bool reset);
+
 /** Create a Skia/Vulkan renderer for an existing XCB window.
  *
- * The XCB connection and window must outlive the returned renderer. The window
- * must already be created and mapped by the caller.
+ * The window must already be created and mapped by the caller. The renderer
+ * opens its own XCB connection for Vulkan WSI so presentation cannot consume
+ * the window manager's X events.
  */
 awesome_skia_renderer_t *awesome_skia_renderer_create(
     xcb_connection_t *connection,
@@ -48,8 +67,8 @@ bool awesome_skia_renderer_resize(
  *
  * A renderer has at most one active frame.  Finish it with
  * awesome_skia_renderer_end_frame() before beginning another one.  All canvas
- * operations below record directly into Skia's Vulkan-backed surface; they do
- * not allocate or rasterize through a CPU image surface.
+ * operations below record into a persistent Vulkan-backed content surface;
+ * presentation then composites that surface into the acquired swapchain image.
  */
 awesome_skia_frame_t *awesome_skia_renderer_begin_frame(
     awesome_skia_renderer_t *renderer,
@@ -63,6 +82,11 @@ bool awesome_skia_renderer_end_frame(
     awesome_skia_frame_t *frame,
     char *error,
     size_t error_size);
+
+/** True for the first frame after the renderer's retained content surface was
+ * created or resized. The caller must repaint its whole logical surface. */
+bool awesome_skia_frame_needs_full_redraw(const awesome_skia_frame_t *frame);
+void awesome_skia_frame_mark_content_repaint(awesome_skia_frame_t *frame);
 
 /** Minimal GPU canvas ABI used by the first Skia-native drawing clients.
  * Colors use 0xRRGGBBAA. Coordinates are in device pixels.

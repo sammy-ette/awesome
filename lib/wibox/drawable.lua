@@ -20,6 +20,7 @@ local object = require("gears.object")
 local surface = require("gears.surface")
 local region = require("gears.region")
 local timer = require("gears.timer")
+local glib = require("lgi").GLib
 local grect =  require("gears.geometry").rectangle
 local matrix = require("gears.matrix")
 local whierarchy = require("wibox.hierarchy")
@@ -29,6 +30,16 @@ local visible_drawables = {}
 
 local systray_widget
 local get_widget_context
+
+local function defer_redraw(self)
+    if self._frame_retry_pending then return end
+    self._frame_retry_pending = true
+    timer.start_new(1 / 120, function()
+        self._frame_retry_pending = false
+        self:draw()
+        return false
+    end)
+end
 
 local function do_redraw(self)
     if not self.drawable.valid then return end
@@ -42,10 +53,33 @@ local function do_redraw(self)
         error("Skia/Vulkan could not create a drawable renderer")
     end
 
-    local cr = skia.begin(renderer)
+    local cr, begin_error = skia.begin(renderer)
+    if not cr then
+        if begin_error == "Skia frame unavailable" then
+            defer_redraw(self)
+            return
+        end
+        error("Skia/Vulkan could not begin a drawable frame: " ..
+            tostring(begin_error))
+    end
     local geom = self.drawable:geometry()
     local x, y, width, height = geom.x, geom.y, geom.width, geom.height
     local context = get_widget_context(self)
+
+    -- The renderer owns a complete retained GPU image for this drawin. Never
+    -- patch it by a dirty rectangle: a widget/layout update invalidates the
+    -- whole cached image, while pure outer geometry/opacity animation can
+    -- present it again without traversing Lua widgets at all.
+    if cr:needs_full_redraw() then
+        self._need_complete_repaint = true
+    end
+    local forced_content_repaint = self._need_complete_repaint
+    -- A layout signal is semantic invalidation even when the affected widgets
+    -- happen to keep identical extents (for example, a same-size reorder).
+    -- Keep it separate from the region so retained rendering cannot turn that
+    -- valid update into a stale cache replay.
+    local layout_invalidated = self._layout_invalidated
+    self._layout_invalidated = false
 
     if self._need_relayout or self._need_complete_repaint then
         self._need_relayout = false
@@ -57,6 +91,7 @@ local function do_redraw(self)
                 systray_widget:_kickout(context)
             end
         else
+            forced_content_repaint = true
             self._need_complete_repaint = true
             if self._widget then
                 self._widget_hierarchy_callback_arg = {}
@@ -68,23 +103,34 @@ local function do_redraw(self)
         end
     end
 
-    -- Vulkan swapchains do not retain their contents across every resize and
-    -- exposure, so repaint the full drawin. The Cairo Region is only retained
-    -- here for layout invalidation during the transition; it is not a raster
-    -- target and never receives drawing commands.
     self._need_complete_repaint = false
-    self._dirty_area = region.new()
-    cr:clip_rect(0, 0, width, height)
-    cr:set_source(self._background_color_spec or "#000000")
-    cr:paint()
-
-    if self.background_image and type(self.background_image) == "function" then
-        self.background_image(context, cr, width, height, unpack(self.background_image_args))
+    local content_invalid = forced_content_repaint or layout_invalidated or
+        not self._dirty_area:is_empty()
+    if content_invalid and os.getenv("AWESOME_SKIA_PROFILE_DETAIL") == "1" then
+        print("Skia cache rebuild", self.drawable_name,
+            "full=" .. tostring(forced_content_repaint),
+            "dirty=" .. tostring(not self._dirty_area:is_empty()))
     end
+    self._dirty_area = region.new()
 
-    if self._widget_hierarchy then
-        cr:set_source(self._foreground_color_spec or "#ffffff")
-        self._widget_hierarchy:draw(context, cr)
+    if content_invalid then
+        cr:mark_content_repaint()
+        -- Paint the cache at its complete logical size. The outer drawin can
+        -- reveal only a portion while animating, but later frames must already
+        -- have valid pixels for rows that become visible.
+        cr:clip_rect(0, 0, width, height)
+        cr:clear(0x00000000)
+        cr:set_source(self._background_color_spec or "#000000")
+        cr:paint()
+
+        if self.background_image and type(self.background_image) == "function" then
+            self.background_image(context, cr, width, height, unpack(self.background_image_args))
+        end
+
+        if self._widget_hierarchy then
+            cr:set_source(self._foreground_color_spec or "#ffffff")
+            self._widget_hierarchy:draw(context, cr)
+        end
     end
 
     cr:present()
@@ -191,6 +237,7 @@ function drawable:set_widget(widget)
 
     -- Make sure the widget gets drawn
     self._need_relayout = true
+    self._layout_invalidated = true
     self.draw()
 end
 
@@ -347,6 +394,7 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     ret._widget_context_skeleton = widget_context_skeleton
     ret._need_complete_repaint = true
     ret._need_relayout = true
+    ret._layout_invalidated = true
     ret._dirty_area = region.new()
     setup_signals(ret)
 
@@ -357,6 +405,13 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     end
 
     -- Only redraw a drawable once, even when we get told to do so multiple times.
+    --
+    -- Do not use gears.timer.delayed_call here.  That queue is drained in its
+    -- entirety by Awesome's `refresh` signal, so opening a panel can run every
+    -- visible drawin's layout, Pango and Vulkan submission in one main-loop
+    -- iteration.  A single slow drawin is unavoidable on this thread; a whole
+    -- batch is not.  An idle source gives pending X/input sources priority
+    -- between drawins, while retaining redraw coalescing for each drawable.
     ret._redraw_pending = false
     ret._do_redraw = function()
         ret._redraw_pending = false
@@ -366,8 +421,11 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     -- Connect our signal when we need a redraw
     ret.draw = function()
         if not ret._redraw_pending then
-            timer.delayed_call(ret._do_redraw)
             ret._redraw_pending = true
+            glib.idle_add(glib.PRIORITY_DEFAULT_IDLE, function()
+                ret._do_redraw()
+                return false
+            end)
         end
     end
     ret._do_complete_repaint = function()
@@ -434,6 +492,7 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
             return
         end
         ret._need_relayout = true
+        ret._layout_invalidated = true
         -- When not visible, we will be redrawn when we become visible. In the
         -- mean-time, the layout does not matter much.
         if ret._visible then

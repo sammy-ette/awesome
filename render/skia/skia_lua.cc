@@ -654,6 +654,12 @@ int frame_begin(lua_State *L)
 
     char error[256] = {0};
     awesome_skia_frame_t *native = awesome_skia_renderer_begin_frame(renderer, error, sizeof(error));
+    if (!native && std::strcmp(error, "Skia frame unavailable") == 0)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, error);
+        return 2;
+    }
     if (!native)
         return luaL_error(L, "could not begin Skia frame: %s", error);
 
@@ -664,6 +670,35 @@ int frame_begin(lua_State *L)
     frame->states.push_back(frame->state);
     luaL_getmetatable(L, k_frame_type);
     lua_setmetatable(L, -2);
+    return 1;
+}
+
+/* skia.stats([reset]) -- aggregate renderer timing in milliseconds. */
+int skia_stats(lua_State *L)
+{
+    awesome_skia_timing_stats_t stats = {};
+    const bool available = awesome_skia_get_timing_stats(&stats, lua_toboolean(L, 1));
+    lua_newtable(L);
+    auto put_number = [L](const char *name, lua_Number value) {
+        lua_pushnumber(L, value);
+        lua_setfield(L, -2, name);
+    };
+    lua_pushboolean(L, available);
+    lua_setfield(L, -2, "available");
+    lua_pushinteger(L, static_cast<lua_Integer>(stats.frames));
+    lua_setfield(L, -2, "frames");
+    lua_pushinteger(L, static_cast<lua_Integer>(stats.content_repaints));
+    lua_setfield(L, -2, "content_repaints");
+    lua_pushinteger(L, static_cast<lua_Integer>(stats.cache_replays));
+    lua_setfield(L, -2, "cache_replays");
+    constexpr lua_Number ns_per_ms = 1000000.0;
+    put_number("window_ms", static_cast<lua_Number>(stats.window_nanoseconds) / ns_per_ms);
+    put_number("acquire_ms", static_cast<lua_Number>(stats.acquire_nanoseconds) / ns_per_ms);
+    put_number("record_ms", static_cast<lua_Number>(stats.record_nanoseconds) / ns_per_ms);
+    put_number("submit_ms", static_cast<lua_Number>(stats.submit_nanoseconds) / ns_per_ms);
+    if (stats.window_nanoseconds > 0)
+        put_number("fps", static_cast<lua_Number>(stats.frames) * 1e9 /
+                           static_cast<lua_Number>(stats.window_nanoseconds));
     return 1;
 }
 
@@ -681,6 +716,12 @@ int skia_context(lua_State *L)
     {
         char error[256] = {0};
         native = awesome_skia_renderer_begin_frame(surface->renderer, error, sizeof(error));
+        if (!native && std::strcmp(error, "Skia frame unavailable") == 0)
+        {
+            lua_pushnil(L);
+            lua_pushstring(L, error);
+            return 2;
+        }
         if (!native)
             return luaL_error(L, "could not begin Skia frame: %s", error);
     }
@@ -746,6 +787,21 @@ int frame_present(lua_State *L)
     frame->frame = nullptr;
     if (!awesome_skia_renderer_end_frame(native, error, sizeof(error)))
         return luaL_error(L, "could not present Skia frame: %s", error);
+    return 0;
+}
+
+int frame_needs_full_redraw(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    lua_pushboolean(L, frame->frame && awesome_skia_frame_needs_full_redraw(frame->frame));
+    return 1;
+}
+
+int frame_mark_content_repaint(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (frame->frame)
+        awesome_skia_frame_mark_content_repaint(frame->frame);
     return 0;
 }
 
@@ -1464,48 +1520,94 @@ SkPaint paint_for_pango_run(const lua_skia_frame *frame, const PangoGlyphItem *r
 void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
                           float origin_x, float baseline_y, const SkPaint &paint)
 {
+    struct cached_text_blob_t
+    {
+        uint64_t hash = 0;
+        sk_sp<SkTextBlob> blob;
+    };
+    /* Pango layouts retain their shaped glyph strings across ordinary widget
+     * redraws. Rebuilding a SkTextBlob for every label on every animation
+     * tick is pure CPU allocation/packing work, so retain the immutable
+     * glyph positions in a deliberately bounded cache. The hash makes pointer
+     * reuse after a Pango relayout safe. */
+    static std::unordered_map<const PangoGlyphString *, cached_text_blob_t> blob_cache;
+
     PangoFont *font = run->item->analysis.font;
-    sk_sp<SkTypeface> typeface = typeface_for_pango_font(font);
-    const float size = pango_font_pixel_size(font);
-    if (!typeface || size <= 0)
-        return;
-
-    SkFont sk_font(typeface, size);
-    configure_sk_font_from_pango(&sk_font, font);
-
     const int count = run->glyphs->num_glyphs;
     if (count <= 0)
         return;
 
-    SkTextBlobBuilder builder;
-    const SkTextBlobBuilder::RunBuffer &buffer = builder.allocRunPos(sk_font, count);
-
-    float pen = origin_x;
-    int emitted = 0;
+    auto hash_word = [](uint64_t hash, uint64_t word) {
+        constexpr uint64_t prime = 1099511628211ULL;
+        for (unsigned shift = 0; shift < 64; shift += 8)
+        {
+            hash ^= (word >> shift) & 0xffU;
+            hash *= prime;
+        }
+        return hash;
+    };
+    uint64_t hash = 1469598103934665603ULL;
+    hash = hash_word(hash, reinterpret_cast<uintptr_t>(font));
+    hash = hash_word(hash, static_cast<uint64_t>(count));
     for (int i = 0; i < count; ++i)
     {
         const PangoGlyphInfo &info = run->glyphs->glyphs[i];
-        /* Pango marks unknown glyphs with a flag in the high bits; drawing
-         * that raw value would index a nonsense glyph in the Skia face. */
-        if (info.glyph != PANGO_GLYPH_EMPTY && !(info.glyph & PANGO_GLYPH_UNKNOWN_FLAG))
-        {
-            buffer.glyphs[emitted] = static_cast<SkGlyphID>(info.glyph);
-            buffer.points()[emitted] = SkPoint::Make(
-                pen + static_cast<float>(info.geometry.x_offset) / PANGO_SCALE,
-                baseline_y + static_cast<float>(info.geometry.y_offset) / PANGO_SCALE);
-            ++emitted;
-        }
-        pen += static_cast<float>(info.geometry.width) / PANGO_SCALE;
-    }
-    /* Unused slots would otherwise draw glyph 0 at (0,0). */
-    for (int i = emitted; i < count; ++i)
-    {
-        buffer.glyphs[i] = 0;
-        buffer.points()[i] = SkPoint::Make(-10000, -10000);
+        hash = hash_word(hash, static_cast<uint64_t>(info.glyph));
+        hash = hash_word(hash, static_cast<uint64_t>(info.geometry.width));
+        hash = hash_word(hash, static_cast<uint64_t>(info.geometry.x_offset));
+        hash = hash_word(hash, static_cast<uint64_t>(info.geometry.y_offset));
     }
 
-    if (emitted > 0)
-        canvas(frame)->drawTextBlob(builder.make(), 0, 0, paint);
+    sk_sp<SkTextBlob> blob;
+    const auto cached = blob_cache.find(run->glyphs);
+    if (cached != blob_cache.end() && cached->second.hash == hash)
+        blob = cached->second.blob;
+
+    if (!blob)
+    {
+        sk_sp<SkTypeface> typeface = typeface_for_pango_font(font);
+        const float size = pango_font_pixel_size(font);
+        if (!typeface || size <= 0)
+            return;
+
+        SkFont sk_font(typeface, size);
+        configure_sk_font_from_pango(&sk_font, font);
+        SkTextBlobBuilder builder;
+        const SkTextBlobBuilder::RunBuffer &buffer = builder.allocRunPos(sk_font, count);
+
+        float pen = 0;
+        int emitted = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            const PangoGlyphInfo &info = run->glyphs->glyphs[i];
+            /* Pango marks unknown glyphs with a flag in the high bits; drawing
+             * that raw value would index a nonsense glyph in the Skia face. */
+            if (info.glyph != PANGO_GLYPH_EMPTY && !(info.glyph & PANGO_GLYPH_UNKNOWN_FLAG))
+            {
+                buffer.glyphs[emitted] = static_cast<SkGlyphID>(info.glyph);
+                buffer.points()[emitted] = SkPoint::Make(
+                    pen + static_cast<float>(info.geometry.x_offset) / PANGO_SCALE,
+                    static_cast<float>(info.geometry.y_offset) / PANGO_SCALE);
+                ++emitted;
+            }
+            pen += static_cast<float>(info.geometry.width) / PANGO_SCALE;
+        }
+        /* Unused slots would otherwise draw glyph 0 at (0,0). */
+        for (int i = emitted; i < count; ++i)
+        {
+            buffer.glyphs[i] = 0;
+            buffer.points()[i] = SkPoint::Make(-10000, -10000);
+        }
+
+        blob = builder.make();
+        if (!blob)
+            return;
+        if (blob_cache.size() >= 2048)
+            blob_cache.clear();
+        blob_cache[run->glyphs] = {hash, blob};
+    }
+
+    canvas(frame)->drawTextBlob(blob, origin_x, baseline_y, paint);
 }
 
 void draw_pango_run(lua_skia_frame *frame, PangoGlyphItem *run,
@@ -2518,6 +2620,8 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "__index", frame_index);
     set_method(L, "__newindex", frame_newindex);
     set_method(L, "present", frame_present);
+    set_method(L, "needs_full_redraw", frame_needs_full_redraw);
+    set_method(L, "mark_content_repaint", frame_mark_content_repaint);
     set_method(L, "clear", frame_clear);
     set_method(L, "save", frame_save);
     set_method(L, "restore", frame_restore);
@@ -2670,6 +2774,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     lua_setfield(L, -2, "FillRule");
 
     set_method(L, "begin", frame_begin);
+    set_method(L, "stats", skia_stats);
     set_method(L, "is_canvas", skia_is_canvas);
     set_method(L, "is_image", skia_is_image);
 #ifdef AWESOME_SKIA_HAS_SVG

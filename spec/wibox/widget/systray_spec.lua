@@ -19,6 +19,7 @@ package.loaded.beautiful = beautiful_mock
 
 local num_systray_icons
 local systray_arguments
+local systray_surface_arguments
 _G.awesome = {
     connect_signal = function() end,
     systray = function(first_arg, ...)
@@ -28,7 +29,8 @@ _G.awesome = {
         end
         return num_systray_icons
     end,
-    systray_surface = function()
+    systray_surface = function(...)
+        systray_surface_arguments = { ... }
         return nil
     end,
 }
@@ -53,6 +55,7 @@ describe("wibox.widget.systray", function()
 
     local function test_systray(available_size, expected_size, expected_base, expected_rows)
         systray_arguments = nil
+        systray_surface_arguments = nil
         local spacing = beautiful_mock.systray_icon_spacing or 0
 
         assert.widget_fit(widget, available_size, expected_size)
@@ -63,6 +66,10 @@ describe("wibox.widget.systray", function()
                            true, '#000000', false, spacing,
                            expected_rows or 1
                        })
+        assert.is.equal(systray_surface_arguments[1],
+                        math.ceil(systray_surface_arguments[1]))
+        assert.is.equal(systray_surface_arguments[2],
+                        math.ceil(systray_surface_arguments[2]))
     end
 
     describe("no spacing", function()

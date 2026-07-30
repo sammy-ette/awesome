@@ -48,6 +48,11 @@ struct drawable_t
      * the Vulkan swapchain every frame. */
     uint16_t skia_capacity_width;
     uint16_t skia_capacity_height;
+    /** The part of a stable backing currently exposed by its outer drawin.
+     * Lua keeps laying widgets out against the capacity, but clips drawing to
+     * these bounds while the drawin is animated open or closed. */
+    uint16_t skia_visible_width;
+    uint16_t skia_visible_height;
     bool skia_stable_backing;
     /** The X11 window to which the renderer presents directly. */
     xcb_window_t presentation_window;

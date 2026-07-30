@@ -316,6 +316,23 @@ local function empty_clip(cr)
     return x2 - x1 == 0 or y2 - y1 == 0
 end
 
+-- Return whether a conservative rectangle can affect the current canvas
+-- clip.  Hierarchy nodes already retain draw extents, including descendants
+-- that legitimately extend beyond their parent, so this lets us reject an
+-- entire off-clip subtree before entering its Lua draw traversal.
+local function intersects_clip(cr, x, y, width, height)
+    if width <= 0 or height <= 0 then return false end
+    local clip_x1, clip_y1, clip_x2, clip_y2 = cr:clip_extents()
+    return x < clip_x2 and clip_x1 < x + width and
+        y < clip_y2 and clip_y1 < y + height
+end
+
+local function child_intersects_clip(cr, child)
+    local x, y, width, height = matrix.transform_rectangle(
+        child:get_matrix_to_parent(), child:get_draw_extents())
+    return intersects_clip(cr, x, y, width, height)
+end
+
 --- Draw a hierarchy to some cairo context.
 -- This function draws the widgets in this widget hierarchy to the given cairo
 -- context. The context's clip is used to skip parts that aren't visible.
@@ -334,6 +351,10 @@ function hierarchy:draw(context, cr)
 
     -- Clip to the draw extents
     local ext_x, ext_y, ext_width, ext_height = self:get_draw_extents()
+    if not intersects_clip(cr, ext_x, ext_y, ext_width, ext_height) then
+        cr:restore()
+        return
+    end
     cr:rectangle(ext_x, ext_y, ext_width, ext_height)
     cr:clip()
 
@@ -365,10 +386,17 @@ function hierarchy:draw(context, cr)
 
         -- Draw its children (We already clipped to the draw extents above)
         call(widget.before_draw_children)
+        -- before/after_draw_child are allowed to alter the canvas for their
+        -- child, so retain their exact call contract.  Ordinary layouts have
+        -- no such hooks and can reject invisible child subtrees here instead
+        -- of paying a save/transform/clip traversal for every one.
+        local can_cull_children = not widget.before_draw_child and not widget.after_draw_child
         for i, wi in ipairs(self:get_children()) do
-            call(widget.before_draw_child, i, wi:get_widget())
-            wi:draw(context, cr)
-            call(widget.after_draw_child, i, wi:get_widget())
+            if not can_cull_children or child_intersects_clip(cr, wi) then
+                call(widget.before_draw_child, i, wi:get_widget())
+                wi:draw(context, cr)
+                call(widget.after_draw_child, i, wi:get_widget())
+            end
         end
         call(widget.after_draw_children)
         -- Clear any path that the widget might have left

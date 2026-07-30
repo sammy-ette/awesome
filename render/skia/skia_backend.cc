@@ -44,17 +44,22 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+constexpr const char k_frame_unavailable[] = "Skia frame unavailable";
 
 void set_error(char *buffer, size_t size, const char *message)
 {
@@ -146,11 +151,16 @@ struct awesome_skia_renderer;
 struct awesome_skia_frame
 {
     awesome_skia_renderer *renderer = nullptr;
+    /* Lua always records to this retained GPU surface. */
     SkCanvas *canvas = nullptr;
+    SkSurface *content_surface = nullptr;
     SkSurface *surface = nullptr;
     int canvas_restore_count = 1;
+    bool needs_full_redraw = false;
+    bool content_repainted = false;
     uint32_t image_index = 0;
     size_t sync_index = 0;
+    std::chrono::steady_clock::time_point record_started;
 };
 
 struct frame_sync_t
@@ -171,6 +181,7 @@ struct retired_swapchain_t
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> images;
     std::vector<sk_sp<SkSurface>> skia_surfaces;
+    sk_sp<SkSurface> content_surface;
     std::vector<frame_sync_t> frame_sync;
 };
 
@@ -191,6 +202,10 @@ struct shared_gpu_t
     VkPhysicalDeviceFeatures enabled_features = {};
     skgpu::VulkanExtensions skia_extensions;
     sk_sp<GrDirectContext> skia_context;
+    std::mutex timing_mutex;
+    awesome_skia_timing_stats_t timing = {};
+    std::chrono::steady_clock::time_point timing_started = std::chrono::steady_clock::now();
+    bool profile_enabled = std::getenv("AWESOME_SKIA_PROFILE") != nullptr;
 
     ~shared_gpu_t()
     {
@@ -208,7 +223,10 @@ std::weak_ptr<shared_gpu_t> global_shared_gpu;
 
 struct awesome_skia_renderer
 {
-    xcb_connection_t *connection = nullptr;
+    /* Vulkan WSI is allowed to wait for and consume X events. It must never
+     * share Awesome's event-loop connection, otherwise presentation can steal
+     * MapRequest/input events from the window manager. */
+    xcb_connection_t *wsi_connection = nullptr;
     xcb_window_t window = XCB_NONE;
     uint32_t requested_width = 0;
     uint32_t requested_height = 0;
@@ -231,10 +249,47 @@ struct awesome_skia_renderer
     std::shared_ptr<shared_gpu_t> gpu;
     std::vector<VkImage> images;
     std::vector<sk_sp<SkSurface>> skia_surfaces;
+    /* Complete drawin contents survive presentation-image rotation. This is
+     * an all-or-nothing cache: Lua either repaints it fully or reuses it. */
+    sk_sp<SkSurface> content_surface;
+    bool content_needs_full_redraw = true;
     std::vector<frame_sync_t> frame_sync;
     std::vector<retired_swapchain_t> retired_swapchains;
     size_t next_sync = 0;
     awesome_skia_frame *active_frame = nullptr;
+
+    static uint64_t elapsed_nanoseconds(std::chrono::steady_clock::time_point start,
+                                        std::chrono::steady_clock::time_point end)
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count());
+    }
+
+    void maybe_report_timing()
+    {
+        if (!gpu || !gpu->profile_enabled)
+            return;
+        std::lock_guard<std::mutex> lock(gpu->timing_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t window_ns = elapsed_nanoseconds(gpu->timing_started, now);
+        if (window_ns < 1000000000ULL)
+            return;
+        const double ms = 1000000.0;
+        const double fps = static_cast<double>(gpu->timing.frames) * 1e9 /
+                           static_cast<double>(window_ns);
+        std::fprintf(stderr,
+                     "Skia profile: frames=%llu rebuilds=%llu replays=%llu fps=%.1f acquire=%.2fms record=%.2fms submit=%.2fms window=%.1fms\n",
+                     static_cast<unsigned long long>(gpu->timing.frames),
+                     static_cast<unsigned long long>(gpu->timing.content_repaints),
+                     static_cast<unsigned long long>(gpu->timing.cache_replays),
+                     fps,
+                     static_cast<double>(gpu->timing.acquire_nanoseconds) / ms,
+                     static_cast<double>(gpu->timing.record_nanoseconds) / ms,
+                     static_cast<double>(gpu->timing.submit_nanoseconds) / ms,
+                     static_cast<double>(window_ns) / ms);
+        gpu->timing = {};
+        gpu->timing_started = now;
+    }
 
     void destroy_frame_sync(std::vector<frame_sync_t> *sync_objects)
     {
@@ -262,6 +317,7 @@ struct awesome_skia_renderer
         {
             destroy_frame_sync(&retired.frame_sync);
             retired.skia_surfaces.clear();
+            retired.content_surface.reset();
             retired.images.clear();
             if (retired.swapchain != VK_NULL_HANDLE)
                 vkDestroySwapchainKHR(device, retired.swapchain, nullptr);
@@ -299,6 +355,7 @@ struct awesome_skia_renderer
 
             destroy_frame_sync(&it->frame_sync);
             it->skia_surfaces.clear();
+            it->content_surface.reset();
             it->images.clear();
             if (it->swapchain != VK_NULL_HANDLE)
                 vkDestroySwapchainKHR(device, it->swapchain, nullptr);
@@ -308,7 +365,11 @@ struct awesome_skia_renderer
 
     bool create_frame_sync(char *error, size_t error_size)
     {
-        const size_t count = std::min<size_t>(2, images.size());
+        /* Keep one synchronization set per presentation image. Limiting this
+         * to two artificially stalls the UI thread when a FIFO swapchain has
+         * a third image available, even though the GPU/presentation engine can
+         * accept another frame. */
+        const size_t count = images.size();
         if (count == 0)
         {
             set_error(error, error_size, "Cannot create frame sync without swapchain images");
@@ -388,9 +449,14 @@ struct awesome_skia_renderer
 
     bool create_xcb_surface(char *error, size_t error_size)
     {
+        if (!wsi_connection)
+        {
+            set_error(error, error_size, "The Skia renderer has no WSI XCB connection");
+            return false;
+        }
         VkXcbSurfaceCreateInfoKHR surface_info = {};
         surface_info.sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR;
-        surface_info.connection = connection;
+        surface_info.connection = wsi_connection;
         surface_info.window = window;
 
         VkResult result = vkCreateXcbSurfaceKHR(instance, &surface_info, nullptr, &xcb_surface);
@@ -662,6 +728,35 @@ struct awesome_skia_renderer
         return false;
     }
 
+    VkPresentModeKHR choose_present_mode()
+    {
+        uint32_t count = 0;
+        VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(
+            physical_device, xcb_surface, &count, nullptr);
+        if (result != VK_SUCCESS || count == 0)
+            return VK_PRESENT_MODE_FIFO_KHR;
+
+        std::vector<VkPresentModeKHR> modes(count);
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(
+            physical_device, xcb_surface, &count, modes.data());
+        if (result != VK_SUCCESS)
+            return VK_PRESENT_MODE_FIFO_KHR;
+
+        /* MAILBOX is tear-free like FIFO, but replaces an obsolete queued
+         * frame with the newest animation state instead of stalling the UI
+         * thread behind it. If it is unavailable, IMMEDIATE is preferable for
+         * a window manager: one FIFO-blocked popup must not freeze Awesome's
+         * single Lua/X11 event thread. FIFO remains the required final
+         * fallback for WSI implementations that expose neither. */
+        for (VkPresentModeKHR mode : modes)
+            if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
+                return mode;
+        for (VkPresentModeKHR mode : modes)
+            if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+                return mode;
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+
     bool create_swapchain(uint32_t width, uint32_t height,
                           char *error, size_t error_size)
     {
@@ -735,7 +830,7 @@ struct awesome_skia_renderer
         create_info.preTransform = capabilities.currentTransform;
         create_info.compositeAlpha =
             choose_composite_alpha(capabilities.supportedCompositeAlpha);
-        create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        create_info.presentMode = choose_present_mode();
         create_info.clipped = VK_TRUE;
         create_info.oldSwapchain = swapchain;
 
@@ -756,6 +851,7 @@ struct awesome_skia_renderer
         retired.swapchain = swapchain;
         retired.images = std::move(images);
         retired.skia_surfaces = std::move(skia_surfaces);
+        retired.content_surface = std::move(content_surface);
         retired.frame_sync = std::move(frame_sync);
         if (retired.swapchain != VK_NULL_HANDLE)
             retired_swapchains.push_back(std::move(retired));
@@ -830,11 +926,27 @@ struct awesome_skia_renderer
             skia_surfaces.push_back(std::move(surface));
         }
 
+        content_surface = SkSurfaces::RenderTarget(
+            skia_context.get(), skgpu::Budgeted::kYes,
+            SkImageInfo::Make(static_cast<int>(extent.width),
+                              static_cast<int>(extent.height),
+                              color_type, kPremul_SkAlphaType, color_space),
+            1, kTopLeft_GrSurfaceOrigin, nullptr);
+        if (!content_surface)
+        {
+            set_error(error, error_size,
+                      "Skia failed to create the retained drawable content surface");
+            skia_surfaces.clear();
+            return false;
+        }
+        content_needs_full_redraw = true;
+
         return create_frame_sync(error, error_size);
     }
 
     awesome_skia_frame *begin_frame(char *error, size_t error_size)
     {
+        const auto acquire_started = std::chrono::steady_clock::now();
         if (!skia_context || swapchain == VK_NULL_HANDLE || skia_surfaces.empty())
         {
             set_error(error, error_size, "The Skia renderer is not initialized");
@@ -855,8 +967,18 @@ struct awesome_skia_renderer
 
         const size_t sync_index = next_sync;
         frame_sync_t& sync = frame_sync[sync_index];
+        /* Rendering is called from Awesome's Lua/X11 event thread. A FIFO
+         * compositor or a stalled WSI implementation must never park that
+         * thread indefinitely: return control to GLib and retry shortly.
+         * This also prevents one popup's full swapchain from freezing window
+         * management and input for every client. */
         VkResult result = vkWaitForFences(device, 1, &sync.recycle_fence,
-                                          VK_TRUE, UINT64_MAX);
+                                          VK_TRUE, 0);
+        if (result == VK_TIMEOUT)
+        {
+            set_error(error, error_size, k_frame_unavailable);
+            return nullptr;
+        }
         if (result != VK_SUCCESS)
         {
             set_vk_error(error, error_size, "vkWaitForFences", result);
@@ -864,9 +986,14 @@ struct awesome_skia_renderer
         }
 
         uint32_t image_index = 0;
-        result = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
+        result = vkAcquireNextImageKHR(device, swapchain, 0,
                                        sync.image_available, VK_NULL_HANDLE,
                                        &image_index);
+        if (result == VK_NOT_READY)
+        {
+            set_error(error, error_size, k_frame_unavailable);
+            return nullptr;
+        }
         if (result == VK_ERROR_OUT_OF_DATE_KHR)
         {
             if (!create_swapchain(requested_width, requested_height,
@@ -901,7 +1028,8 @@ struct awesome_skia_renderer
             return nullptr;
         }
         frame->renderer = this;
-        frame->canvas = skia_surfaces[image_index]->getCanvas();
+        frame->canvas = content_surface->getCanvas();
+        frame->content_surface = content_surface.get();
         frame->surface = skia_surfaces[image_index].get();
         /* A swapchain SkSurface reuses its SkCanvas across acquisitions.
          * Root-level clips and transforms must be scoped to one presentation;
@@ -909,9 +1037,16 @@ struct awesome_skia_renderer
          * masks the newly revealed rows on this swapchain image. */
         frame->canvas_restore_count = frame->canvas->getSaveCount();
         frame->canvas->save();
+        frame->needs_full_redraw = content_needs_full_redraw;
         frame->image_index = image_index;
         frame->sync_index = sync_index;
+        frame->record_started = std::chrono::steady_clock::now();
         active_frame = frame.get();
+        /* Count acquiring/waiting separately from command recording. The
+         * frame counter is completed in end_frame once present succeeds. */
+        std::lock_guard<std::mutex> lock(gpu->timing_mutex);
+        gpu->timing.acquire_nanoseconds += elapsed_nanoseconds(acquire_started,
+                                                                frame->record_started);
         return frame.release();
     }
 
@@ -924,7 +1059,27 @@ struct awesome_skia_renderer
             return false;
         }
         active_frame = nullptr;
+        const auto submit_started = std::chrono::steady_clock::now();
+        const uint64_t record_time = elapsed_nanoseconds(frame->record_started, submit_started);
         frame->canvas->restoreToCount(frame->canvas_restore_count);
+        /* Every acquired swapchain image receives the same completed content
+         * image. Unlike partial-damage rendering, this never preserves an
+         * old row: cached content is replaced in full on invalidation. */
+        sk_sp<SkImage> content = frame->content_surface->makeImageSnapshot();
+        if (!content)
+        {
+            set_error(error, error_size, "Skia could not snapshot retained drawable content");
+            return false;
+        }
+        SkCanvas *present_canvas = frame->surface->getCanvas();
+        const int present_save_count = present_canvas->getSaveCount();
+        present_canvas->save();
+        present_canvas->clear(SK_ColorTRANSPARENT);
+        SkPaint present_paint;
+        present_paint.setBlendMode(SkBlendMode::kSrc);
+        present_canvas->drawImage(content, 0, 0, SkSamplingOptions(), &present_paint);
+        present_canvas->restoreToCount(present_save_count);
+        content_needs_full_redraw = false;
         frame_sync_t& sync = frame_sync[frame->sync_index];
 
         GrBackendSemaphore render_semaphore =
@@ -979,6 +1134,19 @@ struct awesome_skia_renderer
             return false;
         }
         next_sync = (frame->sync_index + 1) % frame_sync.size();
+        if (gpu)
+        {
+            std::lock_guard<std::mutex> lock(gpu->timing_mutex);
+            gpu->timing.record_nanoseconds += record_time;
+            gpu->timing.submit_nanoseconds += elapsed_nanoseconds(
+                submit_started, std::chrono::steady_clock::now());
+            ++gpu->timing.frames;
+            if (frame->content_repainted)
+                ++gpu->timing.content_repaints;
+            else
+                ++gpu->timing.cache_replays;
+        }
+        maybe_report_timing();
         return true;
     }
 
@@ -1037,6 +1205,7 @@ struct awesome_skia_renderer
         destroy_frame_sync();
 
         skia_surfaces.clear();
+        content_surface.reset();
         images.clear();
         destroy_retired_swapchains();
         skia_context.reset();
@@ -1048,6 +1217,10 @@ struct awesome_skia_renderer
         if (xcb_surface != VK_NULL_HANDLE)
             vkDestroySurfaceKHR(instance, xcb_surface, nullptr);
         xcb_surface = VK_NULL_HANDLE;
+
+        if (wsi_connection)
+            xcb_disconnect(wsi_connection);
+        wsi_connection = nullptr;
 
         /* gpu owns the device, Skia context and instance. Releasing the last
          * renderer tears them down after every swapchain has gone away. */
@@ -1079,10 +1252,17 @@ extern "C" awesome_skia_renderer_t *awesome_skia_renderer_create(
         return nullptr;
     }
 
-    renderer->connection = connection;
     renderer->window = window;
     renderer->requested_width = width;
     renderer->requested_height = height;
+    renderer->wsi_connection = xcb_connect(nullptr, nullptr);
+    if (!renderer->wsi_connection || xcb_connection_has_error(renderer->wsi_connection))
+    {
+        set_error(error, error_size,
+                  "Could not create the dedicated XCB connection for Vulkan WSI");
+        renderer->destroy();
+        return nullptr;
+    }
 
     if (std::shared_ptr<shared_gpu_t> shared = global_shared_gpu.lock())
     {
@@ -1117,6 +1297,28 @@ extern "C" void awesome_skia_renderer_destroy(awesome_skia_renderer_t *renderer)
         return;
     renderer->destroy();
     delete renderer;
+}
+
+extern "C" bool awesome_skia_get_timing_stats(awesome_skia_timing_stats_t *stats, bool reset)
+{
+    if (!stats)
+        return false;
+    std::shared_ptr<shared_gpu_t> gpu = global_shared_gpu.lock();
+    if (!gpu)
+    {
+        *stats = {};
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(gpu->timing_mutex);
+    *stats = gpu->timing;
+    stats->window_nanoseconds = awesome_skia_renderer::elapsed_nanoseconds(
+        gpu->timing_started, std::chrono::steady_clock::now());
+    if (reset)
+    {
+        gpu->timing = {};
+        gpu->timing_started = std::chrono::steady_clock::now();
+    }
+    return true;
 }
 
 extern "C" bool awesome_skia_renderer_resize(
@@ -1159,6 +1361,17 @@ extern "C" bool awesome_skia_renderer_end_frame(
         return false;
     }
     return frame->renderer->end_frame(frame, error, error_size);
+}
+
+extern "C" bool awesome_skia_frame_needs_full_redraw(const awesome_skia_frame_t *frame)
+{
+    return frame && frame->needs_full_redraw;
+}
+
+extern "C" void awesome_skia_frame_mark_content_repaint(awesome_skia_frame_t *frame)
+{
+    if (frame)
+        frame->content_repainted = true;
 }
 
 extern "C" void awesome_skia_frame_clear(awesome_skia_frame_t *frame, uint32_t rgba)

@@ -21,10 +21,19 @@ local setmetatable = setmetatable
 
 local textbox = { mt = {} }
 
+-- PangoFT2 creates a Fontconfig worker for every FontMap. A FontMap is a
+-- process-wide font resource, not textbox state. PangoLayout cannot replace
+-- its context after construction, so layouts share one map and update its
+-- resolution before their own measure/draw pass. Creating one map per textbox
+-- made a busy configuration spawn hundreds of workers and stall Awesome.
+local shared_font_map
+
 local function new_pango_context()
     if PangoFT2 then
-        local font_map = PangoFT2.FontMap.new()
-        return font_map, font_map:create_context()
+        if not shared_font_map then
+            shared_font_map = PangoFT2.FontMap.new()
+        end
+        return shared_font_map, shared_font_map:create_context()
     end
     error("PangoFT2 is required by the Skia text renderer")
 end
@@ -35,7 +44,6 @@ local function setup_dpi(box, dpi)
     if box._private.dpi ~= dpi then
         box._private.dpi = dpi
         if box._private.font_map then
-            -- PangoFT2 keeps resolution on its font map.
             box._private.font_map:set_resolution(dpi, dpi)
         else
             box._private.ctx:set_resolution(dpi)
@@ -567,11 +575,7 @@ function textbox.get_markup_geometry(text, s, font)
     local playout = Pango.Layout.new(pctx)
     playout:set_font_description(beautiful.get_font(font))
     local dpi_scale = beautiful.xresources.get_dpi(s)
-    if font_map then
-        font_map:set_resolution(dpi_scale, dpi_scale)
-    else
-        pctx:set_resolution(dpi_scale)
-    end
+    font_map:set_resolution(dpi_scale, dpi_scale)
     playout:context_changed()
     local attr, parsed = Pango.parse_markup(text, -1, 0)
     playout.attributes, playout.text = attr, parsed
