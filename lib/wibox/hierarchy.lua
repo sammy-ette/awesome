@@ -38,6 +38,7 @@ local function hierarchy_new(redraw_callback, layout_callback, callback_arg)
     local result = {
         _matrix = matrix.identity,
         _matrix_to_device = matrix.identity,
+        _matrix_from_device = nil,
         _need_update = true,
         _widget = nil,
         _context = nil,
@@ -57,9 +58,52 @@ local function hierarchy_new(redraw_callback, layout_callback, callback_arg)
         _parent = nil,
         _children = {},
         _widget_counts = {},
+        -- Whether this exact update took the "subtree only moved" branch
+        -- below (content provably unchanged, only position did) -- read by
+        -- the parent's draw loop to decide whether a shift-blit already
+        -- placed this child's pixels, making a normal redraw redundant.
+        -- Read by the parent, so it must survive past this node's own
+        -- hierarchy_update return; see :draw() in this file.
+        _moved_only = false,
+        -- Whether the *widget* that produced this node opted this specific
+        -- child into shift-blit skipping (set from the layout-result entry's
+        -- `shift_eligible` field, e.g. by wibox.layout.overflow for content
+        -- rows but not its scrollbar). Without this, any node that happens
+        -- to be moved-only would qualify -- which is wrong for something
+        -- like a scrollbar that moves on its own schedule, not with the
+        -- content around it.
+        _shift_eligible = false,
+        -- Whether this exact update found widget/context/size AND position
+        -- all identical to last time -- strictly stronger than _moved_only,
+        -- which allows position to differ. This is the condition under
+        -- which a recorded picture of this node's content is valid to
+        -- replay: nothing that could affect what it draws has changed.
+        -- General and not opt-in (unlike _shift_eligible), since replaying
+        -- a picture instead of re-running :draw() is safe for any widget
+        -- once its content is provably unchanged, not just ones a specific
+        -- parent container has coordinated with.
+        _nothing_changed = false,
+        -- Recorded picture cache for the above. `_picture` is nil until
+        -- first recorded; `_picture_valid` is false whenever it needs
+        -- re-recording (see _redraw()/_layout() and the branches below).
+        _picture = nil,
+        _picture_valid = false,
     }
 
     function result._redraw()
+        -- This node's own content changed (a redraw_needed signal carries
+        -- no size/position information, so hierarchy_update's matrix/size
+        -- comparison alone cannot see this -- a node can be "_nothing_changed"
+        -- by that comparison while its actual drawn content did change, e.g.
+        -- wibox.container.background:set_bg()). Invalidates this node's own
+        -- cached picture and every ancestor's, since an ancestor's cached
+        -- picture has this node's old rendering baked into it.
+        local h = result
+        while h do
+            h._picture_valid = false
+            h._picture = nil
+            h = h._parent
+        end
         redraw_callback(result, callback_arg)
     end
     function result._layout()
@@ -89,6 +133,20 @@ local function hierarchy_new(redraw_callback, layout_callback, callback_arg)
     return result
 end
 
+-- Push new transforms through a subtree that is otherwise still valid.
+-- Everything a node caches apart from its matrices -- its children, their
+-- placement relative to it, its draw extents and its widget counts -- is
+-- expressed in local coordinates, so moving the subtree leaves all of it
+-- correct and only the matrices need refreshing.
+local function hierarchy_retransform(self, matrix_to_parent, matrix_to_device)
+    self._matrix = matrix_to_parent
+    self._matrix_to_device = matrix_to_device
+    self._matrix_from_device = nil
+    for _, child in ipairs(self._children) do
+        hierarchy_retransform(child, child._matrix, child._matrix * matrix_to_device)
+    end
+end
+
 local hierarchy_update
 function hierarchy_update(self, context, widget, width, height, region, matrix_to_parent, matrix_to_device)
     if (not self._need_update) and self._widget == widget and
@@ -97,9 +155,48 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
             matrix.equals(self._matrix, matrix_to_parent) and
             matrix.equals(self._matrix_to_device, matrix_to_device) then
         -- Nothing changed
+        self._nothing_changed = true
         return
     end
 
+    -- The subtree only moved: same widget, same context, same size, and no
+    -- layout signal from this widget or any descendant (`_layout` sets
+    -- `_need_update` on the whole ancestor chain).  A widget's `:layout()`
+    -- never sees a matrix, so its result cannot depend on where the subtree
+    -- sits -- the children and their relative placement are still valid and
+    -- re-running the layout would reproduce them exactly.  Just push the new
+    -- transforms down and redraw the area the subtree left and the one it
+    -- moved to.  This keeps a scroll (or any moving subtree) proportional to
+    -- the nodes on screen instead of relaying out each one every frame.
+    if (not self._need_update) and self._widget == widget and
+            self._context == context and
+            self._size.width == width and self._size.height == height then
+        local ext_x, ext_y, ext_w, ext_h = self:get_draw_extents()
+
+        local ox, oy, ow, oh = matrix.transform_rectangle(self._matrix_to_device,
+            ext_x, ext_y, ext_w, ext_h)
+        ox, oy = math.floor(ox), math.floor(oy)
+        region:union_rectangle(rectangle_int(ox, oy, math.ceil(ow), math.ceil(oh)))
+
+        hierarchy_retransform(self, matrix_to_parent, matrix_to_device)
+
+        local nx, ny, nw, nh = matrix.transform_rectangle(matrix_to_device,
+            ext_x, ext_y, ext_w, ext_h)
+        nx, ny = math.floor(nx), math.floor(ny)
+        region:union_rectangle(rectangle_int(nx, ny, math.ceil(nw), math.ceil(nh)))
+        self._moved_only = true
+        self._nothing_changed = false
+        return
+    end
+
+    self._moved_only = false
+    self._nothing_changed = false
+    -- A structural change (widget/context/size actually differ, or this is
+    -- the first update) makes any cached picture stale regardless of what
+    -- _redraw()/_layout() already invalidated -- e.g. the widget itself was
+    -- swapped out for a different one at this position.
+    self._picture_valid = false
+    self._picture = nil
     self._need_update = false
 
     local old_x, old_y, old_width, old_height
@@ -126,6 +223,7 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
     self._size.height = height
     self._matrix = matrix_to_parent
     self._matrix_to_device = matrix_to_device
+    self._matrix_from_device = nil
 
     -- Connect signals
     if old_widget ~= widget then
@@ -137,14 +235,70 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
     -- Update children
     local old_children = self._children
     local layout_result = base.layout_widget(no_parent, context, widget, width, height)
+
+    -- Give each widget back the node that was holding it last time, rather
+    -- than pairing nodes to widgets by position.  A scrolling list shifts
+    -- every child by a slot, so positional pairing would hand each node a
+    -- widget it did not have before, defeating every per-node check below it
+    -- and forcing a full update of the whole subtree.  The same widget may
+    -- legitimately appear more than once (a layout's spacing widget does), so
+    -- each one keeps a queue of its nodes.
+    -- A node being built for the first time has nothing to match against, so
+    -- skip the bookkeeping entirely rather than allocating for it.
+    local nodes_by_widget, reused
+    if old_children[1] then
+        nodes_by_widget, reused = {}, {}
+        for _, child in ipairs(old_children) do
+            local w = child._widget
+            local nodes = nodes_by_widget[w]
+            if not nodes then
+                nodes = {}
+                nodes_by_widget[w] = nodes
+            end
+            nodes[#nodes + 1] = child
+        end
+    end
+
+    local recycle_index = 1
     self._children = {}
     for _, w in ipairs(layout_result or {}) do
-        local r = table.remove(old_children, 1)
+        local r
+        if nodes_by_widget then
+            local nodes = nodes_by_widget[w._widget]
+            r = nodes and table.remove(nodes, 1)
+            if not r then
+                -- No node held this widget before.  Recycle a node whose widget
+                -- is gone (it updates in full either way) before allocating.
+                repeat
+                    r = old_children[recycle_index]
+                    recycle_index = recycle_index + 1
+                until not r or not reused[r]
+                if r then
+                    local stale = nodes_by_widget[r._widget]
+                    if stale then
+                        for i, node in ipairs(stale) do
+                            if node == r then
+                                table.remove(stale, i)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            if r then
+                reused[r] = true
+            end
+        end
         if not r then
             r = hierarchy_new(self._redraw_callback, self._layout_callback, self._callback_arg)
             r._parent = self
         end
         hierarchy_update(r, context, w._widget, w._width, w._height, region, w._matrix, w._matrix * matrix_to_device)
+        -- Read after the call, since hierarchy_update() may reset it (a
+        -- structural change on this exact node clears both flags at the top
+        -- of the branch above); an opted-in widget re-asserts it on every
+        -- :layout() call regardless, same as any other placement field.
+        r._shift_eligible = w.shift_eligible or false
         table.insert(self._children, r)
     end
 
@@ -159,34 +313,45 @@ function hierarchy_update(self, context, widget, width, height, region, matrix_t
             y2 = math.max(y2, py + pheight)
         end
     end
-    self._draw_extents = {
-        x = x1, y = y1,
-        width = x2 - x1,
-        height = y2 - y1
-    }
+    -- Mutated rather than replaced: a fresh table per node per update is
+    -- garbage generated for every widget in every tree that relayouts.
+    local extents = self._draw_extents
+    extents.x, extents.y = x1, y1
+    extents.width, extents.height = x2 - x1, y2 - y1
 
-    -- Update widget counts
-    self._widget_counts = {}
+    -- Update widget counts, reusing the table for the same reason. It is
+    -- empty for all but the handful of widgets registered via count_widget(),
+    -- so the clear below almost always has nothing to do.
+    local counts = self._widget_counts
+    if next(counts) ~= nil then
+        for w in pairs(counts) do
+            counts[w] = nil
+        end
+    end
     if widgets_to_count[widget] and width > 0 and height > 0 then
-        self._widget_counts[widget] = 1
+        counts[widget] = 1
     end
     for _, h in ipairs(self._children) do
         for w, count in pairs(h._widget_counts) do
-            self._widget_counts[w] = (self._widget_counts[w] or 0) + count
+            counts[w] = (counts[w] or 0) + count
         end
     end
 
     -- Check which part needs to be redrawn
 
     -- Are there any children which were removed? Their area needs a redraw.
+    -- Anything still held above was reused in place and is accounted for by
+    -- its own update.
     for _, child in ipairs(old_children) do
-        local x, y, w, h = matrix.transform_rectangle(child._matrix_to_device, child:get_draw_extents())
-        x = math.floor(x)
-        y = math.floor(y)
-        w = math.ceil(w)
-        h = math.ceil(h)
-        region:union_rectangle(rectangle_int(x, y, w, h))
-        child._parent = nil
+        if not reused[child] then
+            local x, y, w, h = matrix.transform_rectangle(child._matrix_to_device, child:get_draw_extents())
+            x = math.floor(x)
+            y = math.floor(y)
+            w = math.ceil(w)
+            h = math.ceil(h)
+            region:union_rectangle(rectangle_int(x, y, w, h))
+            child._parent = nil
+        end
     end
 
     -- Did we change and need to be redrawn?
@@ -272,8 +437,10 @@ end
 -- @return A matrix describing the transformation.
 -- @method get_matrix_from_device
 function hierarchy:get_matrix_from_device()
-    local m = self:get_matrix_to_device()
-    return m:invert()
+    if not self._matrix_from_device then
+        self._matrix_from_device = self:get_matrix_to_device():invert()
+    end
+    return self._matrix_from_device
 end
 
 --- Get the extents that this hierarchy possibly draws to (in the current coordinate space).
@@ -310,27 +477,162 @@ function hierarchy:get_count(widget)
     return self._widget_counts[widget] or 0
 end
 
---- Does the given cairo context have an empty clip (aka "no drawing possible")?
-local function empty_clip(cr)
-    local x1, y1, x2, y2 = cr:clip_extents()
-    return x2 - x1 == 0 or y2 - y1 == 0
-end
-
--- Return whether a conservative rectangle can affect the current canvas
--- clip.  Hierarchy nodes already retain draw extents, including descendants
+-- Return whether a conservative rectangle can affect a clip whose bounds are
+-- already known.  Hierarchy nodes retain draw extents, including descendants
 -- that legitimately extend beyond their parent, so this lets us reject an
 -- entire off-clip subtree before entering its Lua draw traversal.
-local function intersects_clip(cr, x, y, width, height)
+--
+-- The clip bounds are passed in rather than read here because `clip_extents()`
+-- is a C round-trip returning four values, and the clip is necessarily
+-- identical for every child of a node -- reading it once per child made the
+-- per-frame cost of a long list scale with the number of children for no
+-- added information.
+local function rect_intersects_clip(clip_x1, clip_y1, clip_x2, clip_y2, x, y, width, height)
     if width <= 0 or height <= 0 then return false end
-    local clip_x1, clip_y1, clip_x2, clip_y2 = cr:clip_extents()
     return x < clip_x2 and clip_x1 < x + width and
         y < clip_y2 and clip_y1 < y + height
 end
 
-local function child_intersects_clip(cr, child)
+local function intersects_clip(cr, x, y, width, height)
+    -- Checked before reading the clip so a degenerate node costs no C call.
+    if width <= 0 or height <= 0 then return false end
+    local clip_x1, clip_y1, clip_x2, clip_y2 = cr:clip_extents()
+    return rect_intersects_clip(clip_x1, clip_y1, clip_x2, clip_y2, x, y, width, height)
+end
+
+local function child_intersects_clip(clip_x1, clip_y1, clip_x2, clip_y2, child)
     local x, y, width, height = matrix.transform_rectangle(
         child:get_matrix_to_parent(), child:get_draw_extents())
-    return intersects_clip(cr, x, y, width, height)
+    return rect_intersects_clip(clip_x1, clip_y1, clip_x2, clip_y2, x, y, width, height)
+end
+
+-- Widget draw callbacks are invoked through these rather than a closure built
+-- inside :draw().  A closure there captures the node, widget, context and
+-- canvas, so it has to be allocated again for every node on every frame --
+-- garbage produced on the hottest path in the widget system, for every tree,
+-- whether or not the widget in question even has any of these callbacks.
+-- Passing the state explicitly keeps these as plain shared functions.
+local function call_hook(func, widget, context, cr, width, height)
+    if not func then return end
+    protected_call(func, widget, context, cr, width, height)
+end
+
+local function call_child_hook(func, widget, context, index, child_widget, cr, width, height)
+    if not func then return end
+    protected_call(func, widget, context, index, child_widget, cr, width, height)
+end
+
+-- Draw this node's own widget plus its children into `cr`, which is
+-- whichever canvas the caller wants the commands to land on -- the live
+-- frame for a normal draw, or a picture recorder when (re)building the
+-- cache below. Both work identically here, since everything in this
+-- function operates purely in this node's own local coordinates.
+local function draw_content(self, context, cr, widget, self_width, self_height,
+        clip_x1, clip_y1, clip_x2, clip_y2)
+    -- Draw the widget. Most containers (fixed, place, constraint, stack,
+    -- background, ...) have no :draw() of their own -- their visual
+    -- effect, if any, is entirely in before/after_draw_children -- so
+    -- the save/clip/restore around it would protect nothing and is
+    -- skipped entirely rather than paid on every node of every tree.
+    if widget.draw then
+        cr:save()
+        cr:rectangle(0, 0, self_width, self_height)
+        cr:clip()
+        call_hook(widget.draw, widget, context, cr, self_width, self_height)
+        cr:restore()
+        -- Clear any path that the widget might have left
+        cr:new_path()
+    end
+
+    -- Draw its children (We already clipped to the draw extents above)
+    -- before_draw_children is allowed to narrow the clip and leaves it
+    -- narrowed for the children (wibox.container.background's shape does
+    -- exactly that), so the bounds have to be re-read after it ran --
+    -- but only then, since nothing else here touches the clip.
+    if widget.before_draw_children then
+        call_hook(widget.before_draw_children, widget, context, cr, self_width, self_height)
+        clip_x1, clip_y1, clip_x2, clip_y2 = cr:clip_extents()
+    end
+
+    -- A widget's before_draw_children may have just shifted its own
+    -- already-correct pixels into place instead of clearing them (see
+    -- wibox.layout.overflow's scroll blit). When it has, a child it
+    -- opted into this (._shift_eligible) whose own update this frame
+    -- was itself provably a pure move (._moved_only, from
+    -- hierarchy_update() above) does not need to be redrawn -- the
+    -- shift already put its pixels where they belong, and re-running
+    -- its draw would only be repainting something already correct.
+    --
+    -- Two different "this is a full repaint" signals are checked, not
+    -- one: cr:needs_full_redraw() is a narrow C++/swapchain-recreation
+    -- flag (true only on an actual resize), while
+    -- context._full_content_repaint (set by drawable.lua) covers every
+    -- other reason content_surface gets wiped to blank before this
+    -- traversal -- e.g. any widget::layout_changed elsewhere in the same
+    -- drawable, unrelated to this widget's own subtree. A widget's own
+    -- scroll settling onto a frame where *that* happened to be true was
+    -- the actual cause of a real bug: the blit shifted blank pixels and
+    -- skipped redrawing rows on top of them, leaving them blank until
+    -- something else forced a real repaint. Trusting only the narrower
+    -- flag missed exactly this case.
+    local skip_shifted = widget._private._shift_active
+        and not cr:needs_full_redraw()
+        and not context._full_content_repaint
+
+    -- before/after_draw_child are allowed to alter the canvas for their
+    -- child, so retain their exact call contract.  Ordinary layouts have
+    -- no such hooks and can reject invisible child subtrees here instead
+    -- of paying a save/transform/clip traversal for every one.
+    local before_draw_child = widget.before_draw_child
+    local after_draw_child = widget.after_draw_child
+    local can_cull_children = not before_draw_child and not after_draw_child
+    for i, wi in ipairs(self._children) do
+        if not can_cull_children
+                or child_intersects_clip(clip_x1, clip_y1, clip_x2, clip_y2, wi) then
+            if before_draw_child then
+                call_child_hook(before_draw_child, widget, context, i, wi._widget,
+                    cr, self_width, self_height)
+            end
+            if not (skip_shifted and wi._shift_eligible and wi._moved_only) then
+                wi:draw(context, cr)
+            end
+            if after_draw_child then
+                call_child_hook(after_draw_child, widget, context, i, wi._widget,
+                    cr, self_width, self_height)
+            end
+        end
+    end
+    call_hook(widget.after_draw_children, widget, context, cr, self_width, self_height)
+    -- Clear any path that the widget might have left
+    cr:new_path()
+end
+
+-- Record this node's content into a picture, independent of where it is
+-- actually positioned on screen: recording happens in local,
+-- content-relative coordinates (everything draw_content touches is relative
+-- to this node's own origin), which is exactly what makes the result valid
+-- to replay later regardless of what this node's transform has become.
+-- Recording always covers the full draw extents rather than whatever the
+-- live canvas's current clip happens to be, so the cached picture stays
+-- complete and reusable even if more of it becomes visible on some later
+-- frame that would otherwise have had a narrower clip.
+-- `template_cr` seeds the recording's initial paint from that live frame's
+-- current state (see skia.new_picture_recorder's own comment for why this
+-- specific thing matters: a widget that draws using an inherited ambient
+-- color rather than setting its own would otherwise render wrong the moment
+-- its subtree was cached).
+-- Returns a picture, or nil if the extents are degenerate.
+local function record_picture(self, context, widget, self_width, self_height,
+        ext_x, ext_y, ext_width, ext_height, template_cr)
+    local w, h = math.ceil(ext_width), math.ceil(ext_height)
+    if w <= 0 or h <= 0 then
+        return nil
+    end
+    local recorder = skia.new_picture_recorder(w, h, template_cr)
+    recorder:translate(-ext_x, -ext_y)
+    draw_content(self, context, recorder, widget, self_width, self_height,
+        ext_x, ext_y, ext_x + ext_width, ext_y + ext_height)
+    return recorder:finish_picture()
 end
 
 --- Draw a hierarchy to some cairo context.
@@ -346,61 +648,74 @@ function hierarchy:draw(context, cr)
         return
     end
 
-    cr:save()
-    cr:transform(self:get_matrix_to_parent())
-
-    -- Clip to the draw extents
     local ext_x, ext_y, ext_width, ext_height = self:get_draw_extents()
-    if not intersects_clip(cr, ext_x, ext_y, ext_width, ext_height) then
-        cr:restore()
-        return
+    -- One read of the post-clip bounds serves both purposes below: rejecting
+    -- this node when nothing can be drawn, and culling its children.
+    local clip_x1, clip_y1, clip_x2, clip_y2
+
+    -- push_node() collapses what used to be five separate Lua<->C round
+    -- trips (save, transform, a clip_extents() to test whether this node's
+    -- extents can affect anything, rectangle, clip, another clip_extents()
+    -- for the post-clip bounds below) into one each way -- see the C++ side
+    -- for why that specific sequence was worth collapsing. Guarded rather
+    -- than assumed present: the test double for `skia` is lgi.cairo, which
+    -- has neither push_node nor pop_node, so it falls back to the same
+    -- sequence spelled out longhand.
+    if cr.push_node then
+        local ok
+        ok, clip_x1, clip_y1, clip_x2, clip_y2 = cr:push_node(
+            self:get_matrix_to_parent(), ext_x, ext_y, ext_width, ext_height)
+        if not ok then
+            cr:pop_node()
+            return
+        end
+    else
+        cr:save()
+        cr:transform(self:get_matrix_to_parent())
+        if not intersects_clip(cr, ext_x, ext_y, ext_width, ext_height) then
+            cr:restore()
+            return
+        end
+        cr:rectangle(ext_x, ext_y, ext_width, ext_height)
+        cr:clip()
+        clip_x1, clip_y1, clip_x2, clip_y2 = cr:clip_extents()
     end
-    cr:rectangle(ext_x, ext_y, ext_width, ext_height)
-    cr:clip()
 
     -- Draw if needed
-    if not empty_clip(cr) then
+    if clip_x2 - clip_x1 ~= 0 and clip_y2 - clip_y1 ~= 0 then
         local opacity = widget:get_opacity()
-        local function call(func, extra_arg1, extra_arg2)
-            if not func then return end
-            if not extra_arg2 then
-                protected_call(func, widget, context, cr, self:get_size())
-            else
-                protected_call(func, widget, context, extra_arg1, extra_arg2, cr, self:get_size())
-            end
-        end
+        -- Read once instead of per callback; it is a table lookup plus a
+        -- two-value return that every hook below would otherwise repeat.
+        local self_width, self_height = self:get_size()
 
         -- Prepare opacity handling
         if opacity ~= 1 and cr.push_group then
             cr:push_group()
         end
 
-        -- Draw the widget
-        cr:save()
-        cr:rectangle(0, 0, self:get_size())
-        cr:clip()
-        call(widget.draw)
-        cr:restore()
-        -- Clear any path that the widget might have left
-        cr:new_path()
-
-        -- Draw its children (We already clipped to the draw extents above)
-        call(widget.before_draw_children)
-        -- before/after_draw_child are allowed to alter the canvas for their
-        -- child, so retain their exact call contract.  Ordinary layouts have
-        -- no such hooks and can reject invisible child subtrees here instead
-        -- of paying a save/transform/clip traversal for every one.
-        local can_cull_children = not widget.before_draw_child and not widget.after_draw_child
-        for i, wi in ipairs(self:get_children()) do
-            if not can_cull_children or child_intersects_clip(cr, wi) then
-                call(widget.before_draw_child, i, wi:get_widget())
-                wi:draw(context, cr)
-                call(widget.after_draw_child, i, wi:get_widget())
+        -- _nothing_changed (from hierarchy_update() above) is strictly
+        -- stronger than _moved_only: widget, context, size AND position are
+        -- all identical to last time, not just content. That is exactly the
+        -- condition under which a recorded picture is valid to replay
+        -- instead of re-running every widget's :draw() in this subtree --
+        -- general and not opt-in, unlike the shift-blit skip above, since it
+        -- does not depend on any parent having coordinated a pixel shift.
+        -- skia.new_picture_recorder is checked as the guard for whether the
+        -- backend supports this at all (nil under the lgi.cairo test
+        -- double), same pattern as cr.push_group above.
+        if self._nothing_changed and skia.new_picture_recorder then
+            if not self._picture_valid then
+                self._picture = record_picture(self, context, widget, self_width, self_height,
+                    ext_x, ext_y, ext_width, ext_height, cr)
+                self._picture_valid = true
             end
+            if self._picture then
+                cr:draw_picture(self._picture, ext_x, ext_y)
+            end
+        else
+            draw_content(self, context, cr, widget, self_width, self_height,
+                clip_x1, clip_y1, clip_x2, clip_y2)
         end
-        call(widget.after_draw_children)
-        -- Clear any path that the widget might have left
-        cr:new_path()
 
         -- Apply opacity
         if opacity ~= 1 and cr.pop_group_to_source then
@@ -410,7 +725,11 @@ function hierarchy:draw(context, cr)
         end
     end
 
-    cr:restore()
+    if cr.push_node then
+        cr:pop_node()
+    else
+        cr:restore()
+    end
 end
 
 return hierarchy

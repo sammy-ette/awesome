@@ -5,6 +5,41 @@
 
 local spy = require("luassert.spy")
 local match = require("luassert.match")
+
+-- overflow.lua drives its wheel-scroll easing via a repeating `gears.timer`,
+-- which would never fire inside a test (nothing pumps the GLib main loop
+-- here). Stub it with something the tests can tick synchronously instead.
+local pending_scroll_tick
+package.loaded["gears.timer"] = {
+    start_new = function(_, callback)
+        local stopped = false
+        pending_scroll_tick = function()
+            if stopped then return end
+            if callback() == false then
+                stopped = true
+                pending_scroll_tick = nil
+            end
+        end
+        return {
+            stop = function()
+                stopped = true
+                pending_scroll_tick = nil
+            end,
+        }
+    end,
+}
+
+-- Run the scroll-easing animation to convergence.
+local function settle_scroll_animation()
+    for _ = 1, 1000 do
+        if not pending_scroll_tick then
+            return
+        end
+        pending_scroll_tick()
+    end
+    error("scroll animation did not converge")
+end
+
 local overflow = require("wibox.layout.overflow")
 local base = require("wibox.widget.base")
 local utils = require("wibox.test_utils")
@@ -265,6 +300,7 @@ describe("wibox.layout.overflow.vertical", function()
             })
 
             layout:scroll(1)
+            settle_scroll_animation()
 
             assert.widget_layout(layout, { 100, 20 }, {
                 p(scrollbar,   95,  2,  5, 10),
@@ -529,6 +565,7 @@ describe("wibox.layout.overflow.horizontal", function()
             })
 
             layout:scroll(1)
+            settle_scroll_animation()
 
             assert.widget_layout(layout, { 20, 30 }, {
                 p(scrollbar,  2, 25, 10,  5),

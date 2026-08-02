@@ -26,6 +26,8 @@ extern "C" {
 #include "include/core/SkMatrix.h"
 #include "include/core/SkPaint.h"
 #include "include/core/SkPathBuilder.h"
+#include "include/core/SkPicture.h"
+#include "include/core/SkPictureRecorder.h"
 #include "include/core/SkRect.h"
 #include "include/core/SkPixmap.h"
 #include "include/core/SkShader.h"
@@ -72,6 +74,7 @@ namespace {
 constexpr const char *k_frame_type = "awesome.skia.frame";
 constexpr const char *k_pattern_type = "awesome.skia.pattern";
 constexpr const char *k_image_type = "awesome.skia.image";
+constexpr const char *k_picture_type = "awesome.skia.picture";
 constexpr const char *k_surface_type = "awesome.skia.surface";
 #ifdef AWESOME_SKIA_HAS_SVG
 constexpr const char *k_svg_type = "awesome.skia.svg";
@@ -211,6 +214,13 @@ struct lua_skia_frame
      * skia.new_image_surface(); such a canvas has no swapchain/present cycle
      * and is finished with :snapshot() instead of :present(). */
     sk_sp<SkSurface> offscreen;
+    /* Set instead of `frame`/`offscreen` for a picture-recording canvas
+     * created by skia.new_picture_recorder(); records draw commands rather
+     * than rasterising them, and is finished with :finish_picture() instead
+     * of :present()/:snapshot(). unique_ptr because SkPictureRecorder is
+     * move-only and getRecordingCanvas()'s canvas pointer must stay stable
+     * for the lifetime of this frame. */
+    std::unique_ptr<SkPictureRecorder> recorder;
     /* A vector export canvas owned by lua_skia_surface. */
     SkCanvas *external_canvas = nullptr;
     SkPathBuilder path;
@@ -244,6 +254,15 @@ struct lua_skia_frame
 struct lua_skia_image
 {
     sk_sp<SkImage> image;
+};
+
+/* A recorded sequence of draw commands, ready to be replayed with
+ * frame:draw_picture() -- cheap to build (no rasterisation happens at
+ * record time) and independent of the resolution/transform it is eventually
+ * played back under, unlike a raster snapshot. */
+struct lua_skia_picture
+{
+    sk_sp<SkPicture> picture;
 };
 
 #ifdef AWESOME_SKIA_HAS_SVG
@@ -317,10 +336,29 @@ lua_skia_pattern *test_pattern(lua_State *L, int index)
     return matches ? static_cast<lua_skia_pattern *>(lua_touserdata(L, index)) : nullptr;
 }
 
+/* Non-erroring frame check, for an optional argument (e.g. the template
+ * frame skia.new_picture_recorder() copies paint state from). */
+lua_skia_frame *test_frame(lua_State *L, int index)
+{
+    if (!luaL_testudata(L, index, k_frame_type))
+        return nullptr;
+    return static_cast<lua_skia_frame *>(lua_touserdata(L, index));
+}
+
+lua_skia_picture *test_picture(lua_State *L, int index)
+{
+    if (!lua_isuserdata(L, index) || !lua_getmetatable(L, index))
+        return nullptr;
+    luaL_getmetatable(L, k_picture_type);
+    const bool matches = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);
+    return matches ? static_cast<lua_skia_picture *>(lua_touserdata(L, index)) : nullptr;
+}
+
 lua_skia_frame *check_frame(lua_State *L, int index)
 {
     auto *frame = static_cast<lua_skia_frame *>(luaL_checkudata(L, index, k_frame_type));
-    if (frame->offscreen || frame->external_canvas)
+    if (frame->offscreen || frame->external_canvas || frame->recorder)
         return frame;
     if (!frame->frame || !awesome_skia_frame_canvas(frame->frame))
         luaL_error(L, "Skia frame has already been presented");
@@ -339,6 +377,8 @@ SkCanvas *canvas(lua_skia_frame *frame)
         return frame->group_stack.back().surface->getCanvas();
     if (frame->external_canvas)
         return frame->external_canvas;
+    if (frame->recorder)
+        return frame->recorder->getRecordingCanvas();
     if (frame->offscreen)
         return frame->offscreen->getCanvas();
     return awesome_skia_frame_canvas(frame->frame);
@@ -805,6 +845,42 @@ int frame_mark_content_repaint(lua_State *L)
     return 0;
 }
 
+/* frame:set_present_damage({{x=,y=,width=,height=}, ...}) -- the regions the
+ * widget layer actually repainted, used as a presentation hint only. */
+int frame_set_present_damage(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (!frame->frame)
+        return 0;
+
+    awesome_skia_frame_reset_damage(frame->frame);
+    if (lua_isnoneornil(L, 2))
+        return 0;
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    const int count = static_cast<int>(lua_rawlen(L, 2));
+    for (int i = 1; i <= count; ++i)
+    {
+        lua_rawgeti(L, 2, i);
+        if (lua_istable(L, -1))
+        {
+            auto field = [L](const char *name) {
+                lua_getfield(L, -1, name);
+                const lua_Number value = lua_tonumber(L, -1);
+                lua_pop(L, 1);
+                return value;
+            };
+            awesome_skia_frame_add_damage(frame->frame,
+                                          static_cast<int32_t>(field("x")),
+                                          static_cast<int32_t>(field("y")),
+                                          static_cast<int32_t>(field("width")),
+                                          static_cast<int32_t>(field("height")));
+        }
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
 int frame_clear(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
@@ -872,6 +948,92 @@ int frame_transform_matrix(lua_State *L)
     matrix.setAll(values[0], values[2], values[4], values[1], values[3], values[5],
                   0, 0, 1);
     canvas(frame)->concat(matrix);
+    return 0;
+}
+
+/* frame:push_node(matrix, x, y, width, height) -- collapses the sequence
+ * wibox.hierarchy:draw() runs on *every node of every widget tree, every
+ * frame* (save, transform, a clip_extents() to test whether the node's
+ * extents can affect anything, rectangle, clip, another clip_extents() for
+ * the post-clip bounds the caller culls children against) from five
+ * Lua<->C round trips into one. At the scale this runs -- every node,
+ * every frame -- that round-trip count was a real, measured cost, not a
+ * micro-optimisation for its own sake.
+ *
+ * Always performs the save (and expects a matching pop_node()), regardless
+ * of the return value -- an asymmetric contract (sometimes needing the
+ * matching call, sometimes not, depending on what was returned) would be
+ * easy to get wrong at every call site instead of once here.
+ *
+ * Returns false if this node's extents cannot affect the current clip
+ * (matches wibox.hierarchy's own intersects_clip() exactly: zero/negative
+ * width or height, or no overlap with the clip already in force -- nothing
+ * else about the canvas state is touched beyond the save+transform already
+ * done). Returns true plus the post-clip bounds (x1, y1, x2, y2) --
+ * identical to what frame:clip_extents() would report -- otherwise. */
+int frame_push_node(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    SkCanvas *cv = canvas(frame);
+    cv->save();
+    frame->states.push_back(frame->state);
+
+    const char *names[] = { "xx", "yx", "xy", "yy", "x0", "y0" };
+    SkScalar values[6] = {};
+    for (int index = 0; index < 6; ++index)
+    {
+        lua_getfield(L, 2, names[index]);
+        values[index] = luaL_checknumber(L, -1);
+        lua_pop(L, 1);
+    }
+    SkMatrix matrix;
+    matrix.setAll(values[0], values[2], values[4], values[1], values[3], values[5],
+                  0, 0, 1);
+    cv->concat(matrix);
+
+    const auto x = static_cast<SkScalar>(luaL_checknumber(L, 3));
+    const auto y = static_cast<SkScalar>(luaL_checknumber(L, 4));
+    const auto width = static_cast<SkScalar>(luaL_checknumber(L, 5));
+    const auto height = static_cast<SkScalar>(luaL_checknumber(L, 6));
+
+    SkRect clip_bounds;
+    const bool has_clip = cv->getLocalClipBounds(&clip_bounds);
+    const bool intersects = width > 0 && height > 0 && has_clip &&
+        x < clip_bounds.fRight && clip_bounds.fLeft < x + width &&
+        y < clip_bounds.fBottom && clip_bounds.fTop < y + height;
+
+    if (!intersects)
+    {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+
+    cv->clipRect(SkRect::MakeXYWH(x, y, width, height));
+
+    SkRect new_bounds;
+    if (!cv->getLocalClipBounds(&new_bounds))
+        new_bounds = SkRect::MakeEmpty();
+
+    lua_pushboolean(L, true);
+    lua_pushnumber(L, new_bounds.fLeft);
+    lua_pushnumber(L, new_bounds.fTop);
+    lua_pushnumber(L, new_bounds.fRight);
+    lua_pushnumber(L, new_bounds.fBottom);
+    return 5;
+}
+
+/* frame:pop_node() -- the matching restore for push_node(), always called
+ * exactly once per push_node() regardless of what it returned. */
+int frame_pop_node(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (frame->states.size() <= 1)
+        return luaL_error(L, "pop_node() without matching push_node()");
+    canvas(frame)->restore();
+    frame->state = frame->states.back();
+    frame->states.pop_back();
     return 0;
 }
 
@@ -1724,6 +1886,92 @@ int skia_image_dimensions(lua_State *L)
     return 2;
 }
 
+/* skia.new_picture_recorder(width, height, [template_frame]) -- a canvas that
+ * records draw commands into an SkPicture instead of rasterising them.
+ * Recording itself is cheap (building a command list, no GPU work), and the
+ * result is resolution-independent and replays under any transform, unlike a
+ * raster snapshot -- the two things that make this the right primitive for
+ * caching a subtree's rendering versus the pixel-based approach used
+ * elsewhere (see wibox.layout.overflow's scroll shift, which snapshots
+ * pixels because it specifically wants to translate what's already on
+ * screen).
+ *
+ * template_frame, if given, seeds the new canvas's paint (color, shader,
+ * blend mode, everything SkPaint carries) from that live frame's *current*
+ * state. This is not cosmetic: a fresh recording canvas otherwise starts
+ * with Skia's own default paint (opaque black), not whatever ambient
+ * foreground color the caller had active -- a widget that draws using the
+ * inherited ambient color rather than setting its own (e.g. an unstyled
+ * textbox) would render wrong the moment its subtree was cached. Copying the
+ * live SkPaint verbatim handles that generally -- flat color or shader,
+ * whatever is actually active -- rather than only the common flat-color
+ * case a narrower fix (e.g. passing just a color string) would cover. */
+int skia_new_picture_recorder(lua_State *L)
+{
+    const auto width = static_cast<SkScalar>(luaL_checknumber(L, 1));
+    const auto height = static_cast<SkScalar>(luaL_checknumber(L, 2));
+    if (width <= 0 || height <= 0)
+        return luaL_error(L, "picture recorder dimensions must be positive");
+
+    auto recorder = std::make_unique<SkPictureRecorder>();
+    recorder->beginRecording(SkRect::MakeWH(width, height));
+
+    auto *frame = static_cast<lua_skia_frame *>(lua_newuserdata(L, sizeof(lua_skia_frame)));
+    new (frame) lua_skia_frame();
+    frame->recorder = std::move(recorder);
+    frame->state.paint.setAntiAlias(true);
+    if (lua_skia_frame *template_frame = test_frame(L, 3))
+        frame->state.paint = template_frame->state.paint;
+    frame->states.push_back(frame->state);
+    luaL_getmetatable(L, k_frame_type);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+/* frame:finish_picture() -- ends recording and returns the picture. Only
+ * valid on a frame created by skia.new_picture_recorder(); consumes it, the
+ * same way :snapshot() consumes an offscreen image surface. */
+int frame_finish_picture(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (!frame->recorder)
+        return luaL_error(L, "finish_picture() only applies to a picture recorder "
+                             "(created with skia.new_picture_recorder)");
+    auto *picture = static_cast<lua_skia_picture *>(lua_newuserdata(L, sizeof(lua_skia_picture)));
+    new (picture) lua_skia_picture();
+    picture->picture = frame->recorder->finishRecordingAsPicture();
+    frame->recorder.reset();
+    luaL_getmetatable(L, k_picture_type);
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+/* frame:draw_picture(picture, x, y) -- replays a recorded picture at an
+ * offset under the current transform, same positioning contract as
+ * draw_image(). */
+int frame_draw_picture(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    lua_skia_picture *picture = test_picture(L, 2);
+    if (!picture || !picture->picture)
+        return luaL_argerror(L, 2, "expected a Skia picture");
+    const auto x = static_cast<SkScalar>(luaL_optnumber(L, 3, 0));
+    const auto y = static_cast<SkScalar>(luaL_optnumber(L, 4, 0));
+
+    SkCanvas *target = canvas(frame);
+    if (x != 0 || y != 0)
+    {
+        SkAutoCanvasRestore restore(target, true);
+        target->translate(x, y);
+        target->drawPicture(picture->picture);
+    }
+    else
+    {
+        target->drawPicture(picture->picture);
+    }
+    return 0;
+}
+
 int skia_new_image_surface(lua_State *L)
 {
     const int width = static_cast<int>(luaL_checkinteger(L, 1));
@@ -2110,6 +2358,24 @@ int frame_snapshot(lua_State *L)
     return 1;
 }
 
+/* frame:snapshot_content() -- a non-destructive snapshot of the frame's
+ * persistent content surface, for compositing already-correct pixels back
+ * onto itself (e.g. scroll: shift what's already there instead of re-running
+ * every widget's draw). Unlike :snapshot() above this does not consume
+ * anything -- content_surface remains live and drawable for the rest of this
+ * frame and every frame after. */
+int frame_snapshot_content(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (!frame->frame)
+        return luaL_error(L, "snapshot_content() requires a live frame, not an offscreen surface");
+    sk_sp<SkImage> image(awesome_skia_frame_snapshot_content(frame->frame));
+    if (!image)
+        return luaL_error(L, "no content surface to snapshot");
+    push_image(L, std::move(image));
+    return 1;
+}
+
 /* skia.load_image(path) -> image, or nil plus a message. This is the Skia
  * counterpart to gears.surface loading a file into a cairo surface. */
 int skia_load_image(lua_State *L)
@@ -2165,6 +2431,13 @@ int image_gc(lua_State *L)
 {
     auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
     image->~lua_skia_image();
+    return 0;
+}
+
+int picture_gc(lua_State *L)
+{
+    auto *picture = static_cast<lua_skia_picture *>(luaL_checkudata(L, 1, k_picture_type));
+    picture->~lua_skia_picture();
     return 0;
 }
 
@@ -2622,6 +2895,8 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "present", frame_present);
     set_method(L, "needs_full_redraw", frame_needs_full_redraw);
     set_method(L, "mark_content_repaint", frame_mark_content_repaint);
+    set_method(L, "snapshot_content", frame_snapshot_content);
+    set_method(L, "set_present_damage", frame_set_present_damage);
     set_method(L, "clear", frame_clear);
     set_method(L, "save", frame_save);
     set_method(L, "restore", frame_restore);
@@ -2634,6 +2909,8 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     /* Cairo spelling. A gears.matrix instance carries the same
      * xx/yx/xy/yy/x0/y0 fields, so it is accepted without conversion. */
     set_method(L, "transform", frame_transform_matrix);
+    set_method(L, "push_node", frame_push_node);
+    set_method(L, "pop_node", frame_pop_node);
     set_method(L, "clip", frame_clip);
     set_method(L, "clip_rect", frame_clip_rect);
     set_method(L, "clip_extents", frame_clip_extents);
@@ -2675,6 +2952,8 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "draw_svg", frame_draw_svg);
 #endif
     set_method(L, "snapshot", frame_snapshot);
+    set_method(L, "finish_picture", frame_finish_picture);
+    set_method(L, "draw_picture", frame_draw_picture);
     lua_pop(L, 1);
 
     luaL_newmetatable(L, k_image_type);
@@ -2684,6 +2963,13 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     /* Cairo surface spelling, so call sites that measure an icon work. */
     set_method(L, "get_width", image_get_width);
     set_method(L, "get_height", image_get_height);
+    lua_pop(L, 1);
+
+    /* A picture has no methods of its own (it is only ever passed back into
+     * frame:draw_picture()), so a plain metatable with just __gc is enough --
+     * no need for image_index's computed-property __index dispatch. */
+    luaL_newmetatable(L, k_picture_type);
+    set_method(L, "__gc", picture_gc);
     lua_pop(L, 1);
 
 #ifdef AWESOME_SKIA_HAS_SVG
@@ -2785,6 +3071,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
 #endif
     set_method(L, "image_dimensions", skia_image_dimensions);
     set_method(L, "new_image_surface", skia_new_image_surface);
+    set_method(L, "new_picture_recorder", skia_new_picture_recorder);
     set_method(L, "load_image", skia_load_image);
     set_method(L, "load_svg", skia_load_svg);
     set_method(L, "load_svg_dom", skia_load_svg_dom);

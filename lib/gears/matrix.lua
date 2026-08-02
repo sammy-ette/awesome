@@ -148,12 +148,13 @@ end
 -- @tparam gears.matrix|cairo.Matrix other The matrix to compare with.
 -- @return True if this and the other matrix are equal.
 function matrix:equals(other)
-    for _, k in pairs{ "xx", "xy", "yx", "yy", "x0", "y0" } do
-        if self[k] ~= other[k] then
-            return false
-        end
-    end
-    return true
+    -- Compared field by field rather than by looping over a list of names:
+    -- the list would be a table constructed on every call, and this is called
+    -- for every node of every widget hierarchy on every update, so it was
+    -- allocating far more than it compared.
+    return self.xx == other.xx and self.xy == other.xy
+        and self.yx == other.yx and self.yy == other.yy
+        and self.x0 == other.x0 and self.y0 == other.y0
 end
 
 --- Get a string representation of this matrix

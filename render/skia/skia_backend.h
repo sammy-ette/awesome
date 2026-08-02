@@ -91,6 +91,15 @@ void awesome_skia_frame_mark_content_repaint(awesome_skia_frame_t *frame);
 /** Minimal GPU canvas ABI used by the first Skia-native drawing clients.
  * Colors use 0xRRGGBBAA. Coordinates are in device pixels.
  */
+/* Regions the widget layer repainted this frame, forwarded to the
+ * presentation engine via VK_KHR_incremental_present where available. This is
+ * only a hint: a complete image is rendered regardless, so declaring nothing
+ * is always safe. */
+void awesome_skia_frame_reset_damage(awesome_skia_frame_t *frame);
+void awesome_skia_frame_add_damage(awesome_skia_frame_t *frame,
+                                   int32_t x, int32_t y,
+                                   int32_t width, int32_t height);
+
 void awesome_skia_frame_clear(awesome_skia_frame_t *frame, uint32_t rgba);
 void awesome_skia_frame_save(awesome_skia_frame_t *frame);
 void awesome_skia_frame_restore(awesome_skia_frame_t *frame);
@@ -122,10 +131,21 @@ bool awesome_skia_renderer_draw_demo(
 }
 
 class SkCanvas;
+class SkImage;
 
-/* Internal C++ hook for Awesome's Lua binding. It is intentionally outside the
+/* Internal C++ hooks for Awesome's Lua binding. Intentionally outside the
  * C ABI above so C sources can never accidentally depend on Skia headers. */
 SkCanvas *awesome_skia_frame_canvas(awesome_skia_frame_t *frame);
+
+/* A new ref to a snapshot of the frame's persistent content surface (the
+ * retained image widgets draw into, not the swapchain image), or nullptr.
+ * Unlike the offscreen-surface :snapshot() exposed to Lua, this does not
+ * consume anything -- content_surface must remain drawable for the rest of
+ * this frame and every frame after. Caller takes ownership: unlike
+ * awesome_skia_frame_canvas this crosses into image data rather than a live
+ * canvas, so ownership has to transfer explicitly (matches sk_sp's adopting
+ * pointer constructor on the Lua-binding side). */
+SkImage *awesome_skia_frame_snapshot_content(awesome_skia_frame_t *frame);
 
 #endif
 

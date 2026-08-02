@@ -24,13 +24,14 @@
 -- @supermodule wibox.widget.base
 ---------------------------------------------------------------------------
 
-local cache = require("gears.cache")
 local timer = require("gears.timer")
 local hierarchy = require("wibox.hierarchy")
 local base = require("wibox.widget.base")
 local gtable = require("gears.table")
 local lgi = require("lgi")
 local GLib = lgi.GLib
+local select = select
+local unpack = unpack or table.unpack -- luacheck: globals unpack (compatibility with Lua 5.1)
 
 local scroll = {}
 local _need_scroll_redraw
@@ -47,9 +48,43 @@ local function cleanup_context(context)
     return res
 end
 
+-- A cache with the same interface as gears.cache, but without gears.cache's
+-- "may be dropped by the GC at any time" semantics (see the identical cache
+-- in wibox/widget/base.lua for the full rationale). The hierarchy built here
+-- is meant to be reused across every redraw tick of the scroll animation;
+-- letting the GC evict it under allocation pressure defeats that and forces
+-- a full hierarchy rebuild mid-animation. Entries are bounded by the number
+-- of distinct (context, widget, width, height) combinations actually used,
+-- which in practice is small and stable per scroll widget.
+local strong_cache = {}
+strong_cache.__index = strong_cache
+
+function strong_cache:get(...)
+    local result = self._cache
+    for i = 1, select("#", ...) do
+        local arg = select(i, ...)
+        local next_result = result[arg]
+        if not next_result then
+            next_result = {}
+            result[arg] = next_result
+        end
+        result = next_result
+    end
+    local ret = result._entry
+    if not ret then
+        ret = { self._creation_cb(...) }
+        result._entry = ret
+    end
+    return unpack(ret)
+end
+
+function strong_cache.new(creation_cb)
+    return setmetatable({ _cache = {}, _creation_cb = creation_cb }, strong_cache)
+end
+
 -- Create a hierarchy (and some more stuff) for drawing the given widget. This
 -- allows "some stuff" to be re-used instead of re-created all the time.
-local hierarchy_cache = cache.new(function(context, widget, width, height)
+local hierarchy_cache = strong_cache.new(function(context, widget, width, height)
     context = cleanup_context(context)
     local layouts = setmetatable({}, { __mode = "k" })
 

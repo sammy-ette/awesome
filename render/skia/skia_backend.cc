@@ -161,6 +161,9 @@ struct awesome_skia_frame
     uint32_t image_index = 0;
     size_t sync_index = 0;
     std::chrono::steady_clock::time_point record_started;
+    /* Regions the widget layer actually repainted this frame, forwarded to
+     * VK_KHR_incremental_present. Empty means "assume everything changed". */
+    std::vector<VkRectLayerKHR> damage;
 };
 
 struct frame_sync_t
@@ -200,6 +203,9 @@ struct shared_gpu_t
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queue_family = UINT32_MAX;
     VkPhysicalDeviceFeatures enabled_features = {};
+    /* Whether VK_KHR_incremental_present was enabled on `device`. The device
+     * is process-wide, so this belongs here rather than per renderer. */
+    bool incremental_present = false;
     skgpu::VulkanExtensions skia_extensions;
     sk_sp<GrDirectContext> skia_context;
     std::mutex timing_mutex;
@@ -493,11 +499,35 @@ struct awesome_skia_renderer
             return false;
         }
 
+        /* Rank by device class rather than taking whatever the loader happens
+         * to enumerate first. A system with a real GPU commonly also exposes
+         * a software rasterizer (Mesa's llvmpipe), which satisfies every
+         * requirement checked below while rasterizing every pixel on the CPU
+         * -- picking it silently turns all rendering into CPU load that no
+         * amount of widget-side optimisation can reduce. */
+        auto device_rank = [](VkPhysicalDeviceType type) -> int {
+            switch (type)
+            {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 4;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 3;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return 2;
+            case VK_PHYSICAL_DEVICE_TYPE_OTHER:          return 1;
+            case VK_PHYSICAL_DEVICE_TYPE_CPU:            return 0;
+            default:                                      return 0;
+            }
+        };
+        int best_rank = -1;
+        char best_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {0};
+
         for (VkPhysicalDevice candidate : physical_devices)
         {
             VkPhysicalDeviceProperties properties = {};
             vkGetPhysicalDeviceProperties(candidate, &properties);
             if (properties.apiVersion < VK_API_VERSION_1_1)
+                continue;
+
+            const int rank = device_rank(properties.deviceType);
+            if (rank <= best_rank)
                 continue;
 
             uint32_t extension_count = 0;
@@ -539,13 +569,17 @@ struct awesome_skia_renderer
                 {
                     physical_device = candidate;
                     queue_family = index;
+                    best_rank = rank;
+                    std::snprintf(best_name, sizeof(best_name), "%s",
+                                  properties.deviceName);
                     break;
                 }
             }
-
-            if (physical_device != VK_NULL_HANDLE)
-                break;
         }
+
+        if (physical_device != VK_NULL_HANDLE && std::getenv("AWESOME_SKIA_PROFILE"))
+            std::fprintf(stderr, "Skia: using Vulkan device \"%s\"%s\n", best_name,
+                         best_rank == 0 ? " (SOFTWARE RASTERIZER -- expect high CPU)" : "");
 
         if (physical_device == VK_NULL_HANDLE)
         {
@@ -585,9 +619,35 @@ struct awesome_skia_renderer
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &queue_priority;
 
-        const char *device_extensions[] = {
+        /* VK_KHR_incremental_present is a pure optimisation hint: it lets the
+         * presentation engine copy only the regions the widget layer actually
+         * repainted instead of the whole image. It is safe to enable
+         * unconditionally where supported because we still render a complete
+         * image every frame (end_frame blits content_surface whole), so a
+         * driver that ignores the hint is equally correct. */
+        std::vector<const char *> device_extensions = {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         };
+        {
+            uint32_t count = 0;
+            if (vkEnumerateDeviceExtensionProperties(physical_device, nullptr,
+                                                     &count, nullptr) == VK_SUCCESS)
+            {
+                std::vector<VkExtensionProperties> available(count);
+                if (vkEnumerateDeviceExtensionProperties(physical_device, nullptr,
+                                                         &count, available.data()) == VK_SUCCESS &&
+                    contains_extension(available, VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME))
+                {
+                    device_extensions.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
+                    gpu->incremental_present = true;
+                }
+                if (std::getenv("AWESOME_SKIA_PROFILE"))
+                {
+                    std::fprintf(stderr, "Skia: incremental present %s\n",
+                                 gpu->incremental_present ? "enabled" : "unavailable");
+                }
+            }
+        }
 
         /* Start with no optional VkPhysicalDeviceFeatures enabled. This is the
          * least surprising contract for Skia and keeps the backend portable. */
@@ -598,8 +658,8 @@ struct awesome_skia_renderer
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.enabledExtensionCount =
-            static_cast<uint32_t>(std::size(device_extensions));
-        device_info.ppEnabledExtensionNames = device_extensions;
+            static_cast<uint32_t>(device_extensions.size());
+        device_info.ppEnabledExtensionNames = device_extensions.data();
         device_info.pEnabledFeatures = &gpu->enabled_features;
 
         VkResult result = vkCreateDevice(physical_device, &device_info, nullptr, &gpu->device);
@@ -747,7 +807,37 @@ struct awesome_skia_renderer
          * thread behind it. If it is unavailable, IMMEDIATE is preferable for
          * a window manager: one FIFO-blocked popup must not freeze Awesome's
          * single Lua/X11 event thread. FIFO remains the required final
-         * fallback for WSI implementations that expose neither. */
+         * fallback for WSI implementations that expose neither.
+         *
+         * The trade-off is real in both directions, so it is selectable.
+         * MAILBOX lets us render whenever we like, but any frame finished
+         * before the display can show it is *discarded* -- work done and
+         * thrown away. FIFO is true vsync: the presentation engine paces us
+         * to the refresh, so nothing is wasted, and because acquire below
+         * uses a zero timeout (returning VK_NOT_READY rather than blocking,
+         * which the Lua side retries) it still cannot stall the event
+         * thread. AWESOME_SKIA_PRESENT_MODE=fifo|mailbox|immediate. */
+        if (const char *requested = std::getenv("AWESOME_SKIA_PRESENT_MODE"))
+        {
+            VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;
+            bool recognised = true;
+            if (std::strcmp(requested, "fifo") == 0)
+                wanted = VK_PRESENT_MODE_FIFO_KHR;
+            else if (std::strcmp(requested, "mailbox") == 0)
+                wanted = VK_PRESENT_MODE_MAILBOX_KHR;
+            else if (std::strcmp(requested, "immediate") == 0)
+                wanted = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            else
+                recognised = false;
+
+            if (recognised)
+                for (VkPresentModeKHR mode : modes)
+                    if (mode == wanted)
+                        return mode;
+            /* FIFO is required to be supported, so an unavailable or
+             * misspelled request falls through to the default order. */
+        }
+
         for (VkPresentModeKHR mode : modes)
             if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
                 return mode;
@@ -1106,6 +1196,24 @@ struct awesome_skia_renderer
         present_info.pSwapchains = &swapchain;
         present_info.pImageIndices = &frame->image_index;
 
+        /* Tell the presentation engine which parts actually changed. This is
+         * only ever a hint -- the image itself is complete either way -- so
+         * an empty region list simply means "no claim", not "nothing
+         * changed", and the whole image is presented as before. */
+        VkPresentRegionsKHR present_regions = {};
+        VkPresentRegionKHR present_region = {};
+        if (gpu->incremental_present && !frame->damage.empty())
+        {
+            present_region.rectangleCount =
+                static_cast<uint32_t>(frame->damage.size());
+            present_region.pRectangles = frame->damage.data();
+
+            present_regions.sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR;
+            present_regions.swapchainCount = 1;
+            present_regions.pRegions = &present_region;
+            present_info.pNext = &present_regions;
+        }
+
         VkResult result = vkQueuePresentKHR(queue, &present_info);
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
             return create_swapchain(requested_width, requested_height,
@@ -1374,6 +1482,38 @@ extern "C" void awesome_skia_frame_mark_content_repaint(awesome_skia_frame_t *fr
         frame->content_repainted = true;
 }
 
+extern "C" void awesome_skia_frame_reset_damage(awesome_skia_frame_t *frame)
+{
+    if (frame)
+        frame->damage.clear();
+}
+
+extern "C" void awesome_skia_frame_add_damage(awesome_skia_frame_t *frame,
+                                              int32_t x, int32_t y,
+                                              int32_t width, int32_t height)
+{
+    if (!frame || width <= 0 || height <= 0)
+        return;
+    /* Clamp into the surface: the presentation engine rejects regions that
+     * fall outside the image, and widget-side damage is computed in logical
+     * coordinates that can extend past it. */
+    const int32_t max_width = frame->surface ? frame->surface->width() : 0;
+    const int32_t max_height = frame->surface ? frame->surface->height() : 0;
+    const int32_t x0 = std::max(0, x);
+    const int32_t y0 = std::max(0, y);
+    const int32_t x1 = std::min(max_width, x + width);
+    const int32_t y1 = std::min(max_height, y + height);
+    if (x1 <= x0 || y1 <= y0)
+        return;
+
+    VkRectLayerKHR rect = {};
+    rect.offset = { x0, y0 };
+    rect.extent = { static_cast<uint32_t>(x1 - x0),
+                    static_cast<uint32_t>(y1 - y0) };
+    rect.layer = 0;
+    frame->damage.push_back(rect);
+}
+
 extern "C" void awesome_skia_frame_clear(awesome_skia_frame_t *frame, uint32_t rgba)
 {
     if (frame && frame->canvas)
@@ -1457,6 +1597,13 @@ extern "C" void awesome_skia_frame_draw_circle(awesome_skia_frame_t *frame,
 SkCanvas *awesome_skia_frame_canvas(awesome_skia_frame_t *frame)
 {
     return frame ? frame->canvas : nullptr;
+}
+
+SkImage *awesome_skia_frame_snapshot_content(awesome_skia_frame_t *frame)
+{
+    if (!frame || !frame->content_surface)
+        return nullptr;
+    return frame->content_surface->makeImageSnapshot().release();
 }
 
 extern "C" bool awesome_skia_renderer_draw_demo(

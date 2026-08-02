@@ -31,6 +31,31 @@ local visible_drawables = {}
 local systray_widget
 local get_widget_context
 
+local function monotonic_seconds()
+    return glib.get_monotonic_time() / 1e6
+end
+
+-- There is no frame-clock/vsync signal from the backend to align to, so
+-- coalesce invalidations to at most one repaint per this interval instead of
+-- redrawing on every idle-loop iteration a fast event source can trigger.
+-- Present mode is already mailbox where available (skia_backend.cc), so the
+-- GPU already discards excess frames correctly; this just stops the Lua
+-- record/submit side from doing work faster than a frame could ever be shown,
+-- which is what turns even throughput into uneven, stutter-looking pacing.
+local target_fps = tonumber(os.getenv("AWESOME_SKIA_TARGET_FPS")) or 60
+local MIN_FRAME_INTERVAL = 1 / target_fps
+
+-- Deliberate under-shoot, because deferring a redraw goes through
+-- `gears.timer`, which quantizes its timeout to whole milliseconds
+-- (`gmath.round(timeout * 1000)`). At 60fps the interval is 16.667ms, so a
+-- wait computed to land exactly on it rounds *up* to 17ms -- the pacer would
+-- then be the very thing preventing the frame rate it is trying to hold,
+-- capping at 58.8fps no matter how fast everything else got. Subtracting a
+-- 2ms slack means a frame that is ready near the target is let through
+-- immediately rather than pushed into the next millisecond bucket; bursts
+-- much faster than the target are still coalesced, which is the actual job.
+local FRAME_PACING_SLACK = 0.002
+
 local function defer_redraw(self)
     if self._frame_retry_pending then return end
     self._frame_retry_pending = true
@@ -41,9 +66,67 @@ local function defer_redraw(self)
     end)
 end
 
+-- Per-drawable performance overlay, enabled with AWESOME_SKIA_DEBUG_OVERLAY=1.
+-- The overlay's box is damaged like any other changed region rather than
+-- forcing a full repaint, so enabling it costs one small clipped repaint per
+-- frame instead of redrawing the whole drawable.
+local DEBUG_OVERLAY = os.getenv("AWESOME_SKIA_DEBUG_OVERLAY") == "1"
+local OVERLAY_FONT_SIZE, OVERLAY_LINE_HEIGHT, OVERLAY_PAD = 10, 12, 4
+
+-- Everything shown describes the *previous* frame: the overlay has to be
+-- both damaged and drawn before the frame carrying it can finish.
+local function debug_overlay_lines(self, width, height)
+    local stats = self._debug_stats
+    return {
+        tostring(self.drawable_name),
+        string.format("%4.1f fps   %5.2f ms", stats.fps, stats.last_ms),
+        string.format("%s   %dx%d", stats.mode, width, height),
+    }
+end
+
+-- show_text() exposes no measurement call, so the box is sized from an
+-- approximate advance width for the monospace face.
+local function debug_overlay_box(lines)
+    local text_width = 0
+    for _, line in ipairs(lines) do
+        text_width = math.max(text_width, #line * OVERLAY_FONT_SIZE * 0.62)
+    end
+    return math.ceil(text_width) + OVERLAY_PAD * 2,
+        #lines * OVERLAY_LINE_HEIGHT + OVERLAY_PAD * 2
+end
+
+local function draw_debug_overlay(self, cr)
+    local stats = self._debug_stats
+    local lines = stats.lines
+    if not lines then return end
+
+    cr:save()
+    cr:set_source("#000000c8")
+    cr:rectangle(0, 0, stats.box_width, stats.box_height)
+    cr:fill()
+    cr:new_path()
+    -- Red once a frame misses the 60fps budget, green while it fits.
+    cr:set_source(stats.last_ms > 16.67 and "#ff5555ff" or "#55ff55ff")
+    for i, line in ipairs(lines) do
+        cr:show_text(line, OVERLAY_PAD,
+            OVERLAY_PAD + i * OVERLAY_LINE_HEIGHT - 3, "monospace", OVERLAY_FONT_SIZE)
+    end
+    cr:restore()
+end
+
 local function do_redraw(self)
     if not self.drawable.valid then return end
     if self._forced_screen and not self._forced_screen.valid then return end
+
+    -- Stamped at the start of work, not after cr:present(): in this
+    -- single-threaded, blocking render loop, the next redraw request can't
+    -- even be delivered until the main loop frees up, which happens right
+    -- as the previous present() finishes. Pacing off the finish time would
+    -- make "elapsed since last frame" read as ~0 every time processing takes
+    -- real wall-clock time, tacking a full extra MIN_FRAME_INTERVAL onto
+    -- every redraw instead of letting an already-at-or-over-budget frame
+    -- run at its natural rate.
+    self._last_redraw_start_time = monotonic_seconds()
 
     local renderer = self.drawable.skia_renderer
     if not renderer then
@@ -104,21 +187,85 @@ local function do_redraw(self)
     end
 
     self._need_complete_repaint = false
+    if DEBUG_OVERLAY then
+        -- Damage the overlay's own box like any other changed region, so it
+        -- rides the normal partial-repaint path: the content underneath it is
+        -- repainted (giving the text a clean background) without touching the
+        -- rest of the drawable. Cover the previous box too, or shrinking text
+        -- would leave the old, wider box behind.
+        local stats = self._debug_stats
+        local lines = debug_overlay_lines(self, width, height)
+        local box_width, box_height = debug_overlay_box(lines)
+        self._dirty_area:union_rectangle({
+            x = 0, y = 0,
+            width = math.max(box_width, stats.box_width or 0),
+            height = math.max(box_height, stats.box_height or 0),
+        })
+        stats.lines, stats.box_width, stats.box_height = lines, box_width, box_height
+    end
+
+    local dirty_region = self._dirty_area
     local content_invalid = forced_content_repaint or layout_invalidated or
-        not self._dirty_area:is_empty()
+        not dirty_region:is_empty()
     if content_invalid and os.getenv("AWESOME_SKIA_PROFILE_DETAIL") == "1" then
         print("Skia cache rebuild", self.drawable_name,
             "full=" .. tostring(forced_content_repaint),
-            "dirty=" .. tostring(not self._dirty_area:is_empty()))
+            "dirty=" .. tostring(not dirty_region:is_empty()))
     end
     self._dirty_area = region.new()
 
     if content_invalid then
         cr:mark_content_repaint()
+        -- Saved so the overlay below can draw outside whatever clip the
+        -- content pass ends up with.
+        cr:save()
         -- Paint the cache at its complete logical size. The outer drawin can
         -- reveal only a portion while animating, but later frames must already
         -- have valid pixels for rows that become visible.
         cr:clip_rect(0, 0, width, height)
+
+        -- A layout signal or a full-repaint trigger can invalidate the cache
+        -- without leaving a matching dirty rectangle (e.g. a same-size
+        -- reorder), so only take the partial path when the region is both
+        -- present and trusted to cover everything that changed.
+        local partial = not forced_content_repaint and not layout_invalidated
+
+        if partial then
+            -- Many small clipped passes cost more than one full repaint once
+            -- the dirty region covers most of the surface or has fragmented
+            -- into a lot of rectangles; bail out to the full path instead.
+            local rect_count = dirty_region:num_rectangles()
+            local dirty_area = 0
+            for i = 0, rect_count - 1 do
+                local r = dirty_region:get_rectangle(i)
+                dirty_area = dirty_area + r.width * r.height
+            end
+            if rect_count > 16 or dirty_area > 0.6 * width * height then
+                partial = false
+            end
+        end
+
+        if partial then
+            cr:new_path()
+            local damage = {}
+            for i = 0, dirty_region:num_rectangles() - 1 do
+                local r = dirty_region:get_rectangle(i)
+                cr:rectangle(r.x, r.y, r.width, r.height)
+                damage[#damage + 1] = r
+            end
+            cr:clip()
+            -- Let the presentation engine copy only what changed. Purely a
+            -- hint: a complete image is rendered either way, so a driver
+            -- without VK_KHR_incremental_present is equally correct.
+            cr:set_present_damage(damage)
+        end
+
+        if DEBUG_OVERLAY then
+            self._debug_stats.mode = partial
+                and ("partial x" .. dirty_region:num_rectangles())
+                or "full"
+        end
+
         cr:clear(0x00000000)
         cr:set_source(self._background_color_spec or "#000000")
         cr:paint()
@@ -129,12 +276,45 @@ local function do_redraw(self)
 
         if self._widget_hierarchy then
             cr:set_source(self._foreground_color_spec or "#ffffff")
+            -- Whether content_surface was just wiped to blank before this
+            -- traversal (the `partial` clip above, negated). A widget that
+            -- shifts its own already-correct pixels back onto itself instead
+            -- of redrawing (see wibox.layout.overflow) needs to know this: it
+            -- is a *different* condition from cr:needs_full_redraw(), which
+            -- is a much narrower C++/swapchain-recreation flag and stays
+            -- false here even though the surface it would be shifting from
+            -- was just cleared. `context` is otherwise a stable, reused
+            -- table (see get_widget_context), so this is one more field on
+            -- it, not a new parameter threaded through every :draw() call.
+            context._full_content_repaint = not partial
             self._widget_hierarchy:draw(context, cr)
+        end
+
+        -- Drop the content clip (including any partial-repaint region) so the
+        -- overlay is never itself clipped away.
+        cr:restore()
+        if DEBUG_OVERLAY then
+            draw_debug_overlay(self, cr)
         end
     end
 
     cr:present()
     self.drawable:refresh()
+
+    if DEBUG_OVERLAY then
+        local stats = self._debug_stats
+        local now = monotonic_seconds()
+        -- The figure shown is the previous frame's, since the overlay is
+        -- necessarily drawn before the frame it belongs to is finished.
+        stats.last_ms = (now - self._last_redraw_start_time) * 1000
+        stats.window_frames = stats.window_frames + 1
+        local elapsed = now - stats.window_start
+        if elapsed >= 1 then
+            stats.fps = stats.window_frames / elapsed
+            stats.window_frames = 0
+            stats.window_start = now
+        end
+    end
 end
 
 -- Get the widget context. This should always return the same table (if
@@ -350,9 +530,13 @@ local function handle_leave(self)
 end
 
 local function handle_motion(self, x, y)
-    local dgeo = self.drawable:geometry()
+    -- geometry().width/height can be inflated to the drawable's historical
+    -- high-water mark (see skia_stable_backing in objects/drawable.c); use
+    -- the actual currently-visible size for the hit bounds check, or mouse
+    -- moves within the now-invisible margin would wrongly count as "inside".
+    local visible_width, visible_height = self.drawable:skia_visible_size()
 
-    if x < 0 or y < 0 or x > dgeo.width or y > dgeo.height then
+    if x < 0 or y < 0 or x > visible_width or y > visible_height then
         return handle_leave(self)
     end
 
@@ -413,6 +597,11 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
     -- batch is not.  An idle source gives pending X/input sources priority
     -- between drawins, while retaining redraw coalescing for each drawable.
     ret._redraw_pending = false
+    ret._last_redraw_start_time = 0
+    ret._debug_stats = {
+        fps = 0, last_ms = 0, mode = "full",
+        window_frames = 0, window_start = monotonic_seconds(),
+    }
     ret._do_redraw = function()
         ret._redraw_pending = false
         do_redraw(ret)
@@ -420,8 +609,28 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
 
     -- Connect our signal when we need a redraw
     ret.draw = function()
-        if not ret._redraw_pending then
-            ret._redraw_pending = true
+        if ret._redraw_pending then return end
+        ret._redraw_pending = true
+
+        -- Pace to at most one repaint per MIN_FRAME_INTERVAL. A drag or
+        -- animation can emit invalidations faster than any refresh could
+        -- show them; without this they still only coalesce down to one
+        -- redraw per idle-loop iteration, which is uneven and reads as
+        -- stutter even though average throughput is fine.
+        --
+        -- Measured from the last redraw's start, not its present. A frame
+        -- that already takes >= MIN_FRAME_INTERVAL to process is already at
+        -- its natural pace by the time it can request the next one; pacing
+        -- off the present timestamp would double-count that processing time
+        -- as extra wait on top of it.
+        local wait = MIN_FRAME_INTERVAL - FRAME_PACING_SLACK
+            - (monotonic_seconds() - ret._last_redraw_start_time)
+        if wait > 0 then
+            timer.start_new(wait, function()
+                ret._do_redraw()
+                return false
+            end)
+        else
             glib.idle_add(glib.PRIORITY_DEFAULT_IDLE, function()
                 ret._do_redraw()
                 return false
