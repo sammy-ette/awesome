@@ -271,4 +271,140 @@ is whether it looks right.
   itself (`build_grabber`) still tracks the cursor 1:1 and cancels any
   in-flight easing first (`_cancel_scroll_animation`), since a direct drag
   should never lag behind the pointer.
-z
+
+## Ranked follow-up list (widget-system efficiency, not overflow-specific)
+
+After the fixes above, the remaining complaint wasn't rendering throughput —
+it was general per-frame overhead in the widget/hierarchy system. Worked in
+the order requested, skipping the `protected_call`-per-draw-callback item
+(rejected: the safety net it removes is load-bearing) and deferring
+buffer-age tracking for the `content_surface` → swapchain blit (parked, not
+needed yet since that blit is always a full-surface copy regardless of what
+changed upstream).
+
+1. **Translation damage / scroll shift-blit.** `overflow.lua`'s row
+   placement marks every content row (not the scrollbar or spacing widgets)
+   `placed.shift_eligible = true`. `before_draw_children()`
+   (`overflow.lua:434`) computes how far the content moved since the last
+   drawn frame (`pending_shift`, valid only when `cache_valid` — no known-good
+   prior frame to shift from otherwise) and, when a real shift is pending,
+   grabs `cr:snapshot_content()` (what `content_surface` already held before
+   this frame's redraw touches it), clears, and blits it back translated by
+   the shift amount instead of re-running every row's draw from scratch.
+   Confined to the content rect via `cr:rectangle()` + `cr:clip()`, and
+   verified rather than assumed to actually cover that whole rect afterwards
+   (`SHIFT_CLIP_EPSILON`-bounded `clip_extents()` check) before committing —
+   `cr:clip()` only narrows, so if `drawable.lua`'s own partial-repaint clip
+   is already tighter than the full content area this frame, the shift would
+   otherwise silently apply to less than intended and leave stale pixels at
+   an edge; falls back to a normal full redraw of every row in that case.
+   `hierarchy:draw()`'s loop then skips redrawing any row that is both
+   `shift_eligible` and provably unchanged since the last update
+   (`hierarchy_update()`'s `_moved_only`), since the shift-blit already left
+   correct pixels there.
+   **Wrong first attempt, kept in history:** the initial version gated the
+   skip on the narrower `cr:needs_full_redraw()` alone (true only across
+   swapchain recreation). That missed the case where `content_surface` gets
+   wiped for a reason local to this widget but unrelated to the shift itself
+   — a sibling widget's `widget::layout_changed` forcing
+   `context._full_content_repaint` elsewhere in the same drawable — which
+   the shift-blit path has no way to see from `needs_full_redraw()` alone.
+   Fixed by threading a second, explicit flag,
+   `context._full_content_repaint` (set in `drawable.lua` before calling
+   `self._widget_hierarchy:draw()`), down to both `overflow.lua` and
+   `hierarchy.lua`, and gating on both.
+2. **Retained `SkPicture`s for unchanged subtrees.** `hierarchy.lua`'s
+   `hierarchy_update()` now distinguishes three states per node: a full
+   structural change (`_nothing_changed = false`, `_picture_valid = false`,
+   cache dropped), moved-only (position changed, content didn't —
+   `_moved_only = true`), and truly nothing changed — neither position nor
+   content (`_nothing_changed = true`, new). `hierarchy:draw()` (line ~696)
+   checks the last case: if `skia.new_picture_recorder` exists (guards the
+   `lgi.cairo` test stub, which lacks it) and the node's cached `_picture` is
+   still valid, it replays the cached picture (`cr:draw_picture`) instead of
+   walking the widget's `draw()`/`before_draw_children`/children chain again.
+   The picture is (re)built via `record_picture()` (line 625), a local
+   function that opens a `skia.new_picture_recorder(w, h, template_cr)`,
+   translates to the node's extents origin, and records through the same
+   `draw_content()` path used by the live-canvas case — so there is exactly
+   one code path for "how a node draws its children," just aimed at either a
+   live canvas or a recorder.
+   Two failure modes were designed out up front, both because the earlier
+   (reverted) raster-snapshot "Phase 4" attempt died from exactly this class
+   of bug:
+   - *Ambient paint state.* A freshly-opened recording canvas starts from
+     Skia's own default (opaque black), not whatever was ambient on the live
+     canvas that requested the recording. `skia.new_picture_recorder` takes
+     an explicit template frame argument and copies its *entire* `SkPaint`
+     (not just a color string) onto the new recorder's frame state
+     (`skia_lua.cc`, `skia_new_picture_recorder`), so anti-aliasing, alpha,
+     blend mode, etc. all carry over correctly.
+   - *Redraw-only changes.* A widget can request a repaint
+     (`widget::redraw_needed`) without its layout changing at all — text
+     blinking a cursor, a color animation. `hierarchy.lua`'s `_redraw()` was
+     extended to walk ancestors invalidating `_picture_valid`/`_picture` in
+     addition to its existing job of calling `redraw_callback`, so a
+     redraw-only change still drops the stale cached picture even though
+     `hierarchy_update()` never ran or saw a content change.
+   Verified with a hand-built mock recorder (`skia.new_picture_recorder`
+   returning a fake picture object, `cr:draw_picture` recording what it was
+   asked to draw) rather than by inspection alone, confirming: (a) an
+   unchanged subtree draws once, then replays on subsequent frames without
+   calling the underlying widgets' `draw()` again, (b) a redraw-only signal
+   invalidates the cache and forces a real re-record, (c) the template
+   frame's paint state round-trips through the recorder unchanged.
+   Deliberately **not** extended to `_moved_only` nodes yet (that's
+   `overflow.lua`'s shift-blit's job for its own specific case, item 1 above)
+   — broadening this to cover movement generally, right after two real bugs
+   already came out of this exact feature area in one session, is exactly
+   the kind of scope creep likely to produce a third one. Left as a
+   deliberate follow-up, not to be picked up without being asked.
+3. **Fewer Lua↔C crossings per node.** `hierarchy:draw()`'s per-node entry
+   and exit used to be five separate calls into the C canvas binding every
+   frame, per node: `save()`, `transform()`, an `intersects_clip()` helper
+   that itself called `clip_extents()` to test against the extents box,
+   `rectangle()`, `clip()`, then a second `clip_extents()` afterwards to read
+   back the post-clip bounds used for culling children. At roughly 135 nodes
+   and a 60fps target, that's on the order of 40,000 Lua↔C round trips a
+   second just for bookkeeping that does no actual drawing.
+   Collapsed into one call each way: `cr:push_node(matrix, x, y, width,
+   height)` (`skia_lua.cc:974`) applies the transform, tests the extents box
+   against the current clip in native code, and — only if there's a real
+   intersection — narrows the clip and returns the post-clip bounds directly
+   as four return values (`ok, x1, y1, x2, y2`), avoiding the round trip
+   entirely when a subtree would have been culled anyway. `cr:pop_node()`
+   (`skia_lua.cc:1029`) is the matching restore. `hierarchy.lua` (line ~664)
+   uses this fast path when `cr.push_node` exists, and falls back to the
+   original five-call sequence otherwise — kept for the `lgi.cairo` test
+   stub, which implements neither method, so the automated suite still
+   exercises a real, if slower, correctness path.
+   Verified with two hand-built `cr` mocks over a real `wibox.hierarchy`
+   tree: one implementing only `push_node`/`pop_node` (tracking an actual
+   clip-rectangle stack to faithfully emulate the native intersection
+   semantics), one implementing only the old `save`/`transform`/
+   `clip_extents`/`rectangle`/`clip` sequence. Compared which widgets had
+   their `draw()` invoked, and in what order, across both a clip that admits
+   every row and a narrowed clip that should cull some — identical results
+   (`drawn=1,2,3,4,5` full-clip; `drawn=1,2` narrow-clip) on both paths in
+   both cases.
+5. **`VK_KHR_incremental_present`.** Presentation-hint-only: it tells the
+   presentation engine which regions of the swapchain image actually changed
+   this frame (`VkPresentRegionsKHR`/`VkPresentRegionKHR`, chained onto
+   `VkPresentInfoKHR` in `end_frame()`, `skia_backend.cc:1203`), letting it
+   skip recompositing/copying the untouched parts of the screen on
+   compositors that respect the hint. Safe to add without any buffer-age or
+   per-swapchain-image damage tracking specifically because of the
+   architecture fact at the top of this document: `content_surface` is
+   always blitted onto the swapchain image whole, every frame, regardless of
+   what changed — so "what changed" for this hint's purposes is just the
+   drawable's own dirty region (already tracked for Phase 1's partial
+   repaint), no different across swapchain images. Enabled conditionally at
+   device-creation time if the extension is present
+   (`create_device_and_skia()`), reported under `AWESOME_SKIA_PROFILE=1`.
+   Bundled in with this: **device selection was previously "first match,"**
+   which could silently select `llvmpipe` (a CPU software rasterizer) over a
+   real discrete/integrated GPU if `llvmpipe` happened to enumerate first.
+   `choose_device()` now ranks candidates by `VkPhysicalDeviceType`
+   (discrete > integrated > virtual > other > CPU) and picks the best,
+   printing the selected device name and a warning if it's a software
+   rasterizer under `AWESOME_SKIA_PROFILE=1`.

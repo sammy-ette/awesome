@@ -472,8 +472,15 @@ end
 
 -- {{{ Caches
 
--- Indexes are widgets, allow them to be garbage-collected.
-local widget_dependencies = setmetatable({}, { __mode = "kv" })
+-- Index widgets weakly, but keep each dependency set alive for as long as its
+-- child is alive.  The dependency set uses weak keys for its parents, so it
+-- does not keep a discarded parent widget alive.
+--
+-- This distinction matters for the persistent fit/layout cache below.  If the
+-- dependency set itself is weak, a GC sweep can discard it while the cached
+-- layout remains alive.  A later visibility or size change then clears only
+-- the child cache and leaves stale parent layouts in place.
+local widget_dependencies = setmetatable({}, { __mode = "k" })
 
 -- A cache with the same interface as gears.cache, but without gears.cache's
 -- "may be dropped by the GC at any time" semantics. get_widget_context()
@@ -540,16 +547,19 @@ local function record_dependency(parent, child)
     base.check_widget(parent)
     base.check_widget(child)
 
-    local deps = widget_dependencies[child] or {}
+    local deps = widget_dependencies[child]
+    if not deps then
+        deps = setmetatable({}, { __mode = "k" })
+        widget_dependencies[child] = deps
+    end
     deps[parent] = true
-    widget_dependencies[child] = deps
 end
 
 -- Clear the caches for `widget` and all widgets that depend on it.
 local clear_caches
 function clear_caches(widget)
     local deps = widget_dependencies[widget] or {}
-    widget_dependencies[widget] = {}
+    widget_dependencies[widget] = nil
     widget._private.widget_caches = {}
     for w in pairs(deps) do
         clear_caches(w)

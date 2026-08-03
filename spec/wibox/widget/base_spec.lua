@@ -17,6 +17,33 @@ describe("wibox.widget.base", function()
     end)
 
     describe("caches", function()
+        it("keeps parent caches invalidatable after garbage collection", function()
+            local context = {}
+            local child = base.make_widget()
+            local parent = base.make_widget()
+            child.fit = function(_, _, width, height)
+                return width, height
+            end
+
+            parent.layout = function(self, layout_context, width, height)
+                local child_width, child_height = base.fit_widget(
+                    self, layout_context, child, width, height)
+                return { base.place_widget_at(child, 0, 0, child_width, child_height) }
+            end
+
+            local layout = base.layout_widget(no_parent, context, parent, 20, 20)
+            assert.is.equal(20, layout[1]._width)
+
+            -- The parent layout cache is still live, so losing the dependency
+            -- index here used to leave it returning the child's old geometry.
+            collectgarbage("collect")
+            child:set_visible(false)
+
+            layout = base.layout_widget(no_parent, context, parent, 20, 20)
+            assert.is.equal(0, layout[1]._width)
+            assert.is.equal(0, layout[1]._height)
+        end)
+
         it("garbage collectable", function()
             local alive = setmetatable({ widget1, widget2 }, { __mode = "kv" })
             assert.is.equal(2, #alive)
