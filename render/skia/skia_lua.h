@@ -33,6 +33,12 @@ bool awesome_skia_alpha_mask_from_lua(lua_State *L, int index, uint8_t *alpha,
  */
 void awesome_skia_lua_extend(lua_State *L);
 
+/* Build the same namespace as a normal loadable Lua module. Awesome calls the
+ * extension above because its C startup code already owns the `skia` table;
+ * standalone users (including Awexygen) load this entry point through
+ * require("skia"). */
+int awesome_skia_lua_open(lua_State *L);
+
 #ifdef __cplusplus
 }
 #endif

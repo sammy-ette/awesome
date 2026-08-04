@@ -128,25 +128,39 @@ local function do_redraw(self)
     -- run at its natural rate.
     self._last_redraw_start_time = monotonic_seconds()
 
-    local renderer = self.drawable.skia_renderer
-    if not renderer then
+    local raster = self.drawable.skia_raster
+    local renderer = raster and true or self.drawable.skia_renderer
+    if not raster and not renderer then
         -- A drawable with no area gets no renderer; there is nothing to draw.
         local geom = self.drawable:geometry()
         if geom.width == 0 or geom.height == 0 then return end
         error("Skia/Vulkan could not create a drawable renderer")
     end
 
-    local cr, begin_error = skia.begin(renderer)
+    local geom = self.drawable:geometry()
+    local width, height = geom.width, geom.height
+    local cr, begin_error
+    if raster then
+        cr = self.drawable:begin_skia_frame(width, height)
+    else
+        cr, begin_error = skia.begin(renderer)
+    end
     if not cr then
-        if begin_error == "Skia frame unavailable" then
+        if begin_error == "Skia frame unavailable" or
+            begin_error == "Skia surface recovered" then
+            self._need_complete_repaint = true
             defer_redraw(self)
             return
         end
         error("Skia/Vulkan could not begin a drawable frame: " ..
             tostring(begin_error))
     end
-    local geom = self.drawable:geometry()
-    local x, y, width, height = geom.x, geom.y, geom.width, geom.height
+    -- The standalone raster adapter creates a fresh CPU surface for each
+    -- frame. Its snapshot is intentionally consumptive, so never replay an
+    -- unpainted surface when the Lua widget tree has no new damage.
+    if raster then
+        self._need_complete_repaint = true
+    end
     local context = get_widget_context(self)
 
     -- The renderer owns a complete retained GPU image for this drawin. Never
@@ -298,7 +312,18 @@ local function do_redraw(self)
         end
     end
 
-    cr:present()
+    local presented, present_error
+    if raster then
+        local image = cr:snapshot()
+        presented, present_error = self.drawable:present_skia_image(image)
+    else
+        presented, present_error = cr:present()
+    end
+    if not presented and present_error == "Skia surface recovered" then
+        self._need_complete_repaint = true
+        defer_redraw(self)
+        return
+    end
     self.drawable:refresh()
 
     if DEBUG_OVERLAY then
@@ -644,6 +669,14 @@ function drawable.new(d, widget_context_skeleton, drawable_name)
 
     -- Do a full redraw if the surface changes (the new surface has no content yet)
     d:connect_signal("property::surface", ret._do_complete_repaint)
+
+    -- A titlebar is backed by its own Vulkan swapchain.  Resizing it changes
+    -- that swapchain's extent and invalidates its retained content, so a
+    -- geometry signal must schedule a full repaint as well.  Without these
+    -- connections a resize can leave the old image on screen or reveal a
+    -- newly-created swapchain without ever painting it.
+    d:connect_signal("property::width", ret._do_complete_repaint)
+    d:connect_signal("property::height", ret._do_complete_repaint)
 
     -- Do a normal redraw when the drawable moves. This will likely do nothing
     -- in most cases, but it makes us do a complete repaint when we are moved to

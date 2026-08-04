@@ -111,6 +111,11 @@ enable_language(CXX)
     add_library(awesome-skia-renderer STATIC
         ${SOURCE_DIR}/render/skia/skia_backend.cc
         ${SOURCE_DIR}/render/skia/skia_lua.cc)
+    # The same implementation archive is also consumed by the standalone
+    # Lua module used by Awexygen, so its objects must be usable from a shared
+    # module as well as from the Awesome executable.
+    set_target_properties(awesome-skia-renderer PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
     target_include_directories(awesome-skia-renderer
         PUBLIC ${SOURCE_DIR})
     target_include_directories(awesome-skia-renderer SYSTEM PRIVATE
@@ -135,6 +140,19 @@ enable_language(CXX)
             ${SKIA_EXTRA_LIBRARIES}
             ${CMAKE_DL_LIBS}
             Threads::Threads)
+
+    add_library(skia MODULE
+        ${SOURCE_DIR}/render/skia/skia_module.cc)
+    target_include_directories(skia PRIVATE
+        ${SOURCE_DIR}
+        ${LUA_INCLUDE_DIR})
+    target_compile_options(skia PRIVATE -std=c++20 -Wall -Wextra -Wpedantic)
+    target_link_libraries(skia PRIVATE
+        awesome-skia-renderer
+        ${LUA_LIBRARIES})
+    set_target_properties(skia PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "skia")
 
     add_executable(skia-vulkan-probe
         ${SOURCE_DIR}/tests/skia-vulkan-probe.c)
@@ -494,6 +512,7 @@ endif()
 
 # {{{ Installation
 install(TARGETS ${PROJECT_AWE_NAME} RUNTIME DESTINATION bin)
+install(TARGETS skia LIBRARY DESTINATION ${AWESOME_LUA_LIB_PATH})
 install(FILES "utils/awesome-client" DESTINATION bin PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 install(DIRECTORY ${BUILD_DIR}/lib DESTINATION ${AWESOME_DATA_PATH}
     PATTERN "*.in" EXCLUDE)

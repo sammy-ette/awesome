@@ -60,6 +60,7 @@
 namespace {
 
 constexpr const char k_frame_unavailable[] = "Skia frame unavailable";
+constexpr const char k_surface_recovered[] = "Skia surface recovered";
 
 void set_error(char *buffer, size_t size, const char *message)
 {
@@ -847,6 +848,55 @@ struct awesome_skia_renderer
         return VK_PRESENT_MODE_FIFO_KHR;
     }
 
+    /* An X11 compositor can invalidate a Vulkan surface independently of the
+     * swapchain extent.  Treat that as a recoverable presentation event: wait
+     * for the old queue work, discard the surface-local resources, and build a
+     * fresh XCB surface/swapchain.  The retained content is intentionally
+     * discarded too; create_swapchain marks the next frame for a full Lua
+     * repaint. */
+    bool recover_surface(char *error, size_t error_size)
+    {
+        if (active_frame)
+        {
+            set_error(error, error_size,
+                      "Cannot recover a Skia surface while a frame is active");
+            return false;
+        }
+
+        VkResult result = vkDeviceWaitIdle(device);
+        if (result != VK_SUCCESS)
+        {
+            set_vk_error(error, error_size, "vkDeviceWaitIdle", result);
+            return false;
+        }
+
+        destroy_frame_sync();
+        skia_surfaces.clear();
+        content_surface.reset();
+        images.clear();
+        destroy_retired_swapchains();
+
+        if (swapchain != VK_NULL_HANDLE)
+        {
+            vkDestroySwapchainKHR(device, swapchain, nullptr);
+            swapchain = VK_NULL_HANDLE;
+        }
+
+        if (xcb_surface != VK_NULL_HANDLE)
+        {
+            vkDestroySurfaceKHR(instance, xcb_surface, nullptr);
+            xcb_surface = VK_NULL_HANDLE;
+        }
+
+        if (!create_xcb_surface(error, error_size))
+            return false;
+        if (!create_swapchain(requested_width, requested_height,
+                              error, error_size))
+            return false;
+
+        return true;
+    }
+
     bool create_swapchain(uint32_t width, uint32_t height,
                           char *error, size_t error_size)
     {
@@ -1091,6 +1141,13 @@ struct awesome_skia_renderer
                 return nullptr;
             return begin_frame(error, error_size);
         }
+        if (result == VK_ERROR_SURFACE_LOST_KHR)
+        {
+            if (!recover_surface(error, error_size))
+                return nullptr;
+            set_error(error, error_size, k_surface_recovered);
+            return nullptr;
+        }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
         {
             set_vk_error(error, error_size, "vkAcquireNextImageKHR", result);
@@ -1218,6 +1275,19 @@ struct awesome_skia_renderer
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
             return create_swapchain(requested_width, requested_height,
                                     error, error_size);
+        if (result == VK_ERROR_SURFACE_LOST_KHR)
+        {
+            char recovery_error[256] = {0};
+            if (recover_surface(recovery_error, sizeof(recovery_error)))
+            {
+                set_error(error, error_size, k_surface_recovered);
+                return false;
+            }
+            std::snprintf(error, error_size,
+                          "Could not recover a lost Skia surface: %s",
+                          recovery_error[0] ? recovery_error : "unknown error");
+            return false;
+        }
         if (result != VK_SUCCESS)
         {
             set_vk_error(error, error_size, "vkQueuePresentKHR", result);

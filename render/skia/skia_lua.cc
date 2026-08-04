@@ -60,6 +60,7 @@ extern "C" {
 #include <cstring>
 #include <new>
 #include <string>
+#include <strings.h>
 #include <unordered_map>
 #include <vector>
 
@@ -76,6 +77,7 @@ constexpr const char *k_pattern_type = "awesome.skia.pattern";
 constexpr const char *k_image_type = "awesome.skia.image";
 constexpr const char *k_picture_type = "awesome.skia.picture";
 constexpr const char *k_surface_type = "awesome.skia.surface";
+constexpr const char *k_renderer_type = "awesome.skia.renderer";
 #ifdef AWESOME_SKIA_HAS_SVG
 constexpr const char *k_svg_type = "awesome.skia.svg";
 #endif
@@ -203,6 +205,13 @@ std::string styled_svg(const char *path, const char *stylesheet)
 struct canvas_state
 {
     SkPaint paint;
+    /* Keep the Cairo toy-text state on the canvas, just like Cairo does.
+     * Pango-backed Awesome text uses its own path below, but existing config
+     * widgets and third-party modules still use select_font_face(),
+     * set_font_size(), text_extents() and show_text(). */
+    std::string font_family = "sans";
+    SkFontStyle font_style = SkFontStyle::Normal();
+    SkScalar font_size = 12;
 };
 
 struct lua_skia_frame
@@ -227,6 +236,8 @@ struct lua_skia_frame
     canvas_state state;
     std::vector<canvas_state> states;
     SkPoint current = {0, 0};
+    SkPoint subpath_start = {0, 0};
+    bool has_current = false;
     /* Cairo's new_sub_path() means "the next arc starts a fresh sub-path
      * rather than connecting from the current point". Skia expresses that as
      * the forceMoveTo argument to arcTo(), so record it until the arc lands. */
@@ -297,6 +308,16 @@ struct lua_skia_surface
     int height = 0;
 };
 
+/* Standalone Lua callers own the renderer through a real userdata. Awesome's
+ * in-process path still passes its renderer as lightuserdata from the C
+ * drawable object, so the binding accepts both representations. */
+struct lua_skia_renderer
+{
+    awesome_skia_renderer_t *renderer = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
 enum class pattern_kind
 {
     solid,
@@ -343,6 +364,37 @@ lua_skia_frame *test_frame(lua_State *L, int index)
     if (!luaL_testudata(L, index, k_frame_type))
         return nullptr;
     return static_cast<lua_skia_frame *>(lua_touserdata(L, index));
+}
+
+lua_skia_renderer *test_renderer(lua_State *L, int index)
+{
+    if (!luaL_testudata(L, index, k_renderer_type))
+        return nullptr;
+    return static_cast<lua_skia_renderer *>(lua_touserdata(L, index));
+}
+
+awesome_skia_renderer_t *renderer_from_lua(lua_State *L, int index)
+{
+    if (lua_skia_renderer *owned = test_renderer(L, index))
+        return owned->renderer;
+    if (lua_islightuserdata(L, index))
+        return static_cast<awesome_skia_renderer_t *>(lua_touserdata(L, index));
+    return nullptr;
+}
+
+lua_skia_renderer *push_renderer(lua_State *L,
+                                 awesome_skia_renderer_t *renderer,
+                                 uint32_t width, uint32_t height)
+{
+    auto *result = static_cast<lua_skia_renderer *>(
+        lua_newuserdata(L, sizeof(lua_skia_renderer)));
+    new (result) lua_skia_renderer();
+    result->renderer = renderer;
+    result->width = width;
+    result->height = height;
+    luaL_getmetatable(L, k_renderer_type);
+    lua_setmetatable(L, -2);
+    return result;
 }
 
 lua_skia_picture *test_picture(lua_State *L, int index)
@@ -479,6 +531,66 @@ sk_sp<SkFontMgr> font_manager()
     static sk_sp<SkFontMgr> manager =
         SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
     return manager;
+}
+
+SkFont text_font(const lua_skia_frame *frame)
+{
+    sk_sp<SkTypeface> typeface;
+    if (sk_sp<SkFontMgr> manager = font_manager())
+        typeface = manager->matchFamilyStyle(frame->state.font_family.c_str(),
+                                             frame->state.font_style);
+
+    SkFont font(typeface, std::max(frame->state.font_size, 1.0f));
+    font.setSubpixel(true);
+    return font;
+}
+
+SkFontStyle::Slant font_slant(lua_State *L, int index)
+{
+    if (lua_isnumber(L, index))
+    {
+        const int value = static_cast<int>(lua_tointeger(L, index));
+        if (value == 1)
+            return SkFontStyle::kItalic_Slant;
+        if (value == 2)
+            return SkFontStyle::kOblique_Slant;
+        return SkFontStyle::kUpright_Slant;
+    }
+
+    const char *value = lua_tostring(L, index);
+    if (!value)
+        return SkFontStyle::kUpright_Slant;
+    if (strcasecmp(value, "italic") == 0)
+        return SkFontStyle::kItalic_Slant;
+    if (strcasecmp(value, "oblique") == 0)
+        return SkFontStyle::kOblique_Slant;
+    return SkFontStyle::kUpright_Slant;
+}
+
+int font_weight(lua_State *L, int index)
+{
+    if (lua_isnumber(L, index))
+    {
+        /* Cairo's toy API uses NORMAL=0 and BOLD=1. Accept Skia/Pango-like
+         * weights too, since configs commonly pass one of those values. */
+        const int value = static_cast<int>(lua_tointeger(L, index));
+        return value == 0 ? SkFontStyle::kNormal_Weight
+                                       : value == 1 ? SkFontStyle::kBold_Weight
+                                       : std::clamp(value,
+                                                    static_cast<int>(SkFontStyle::kThin_Weight),
+                                                    static_cast<int>(SkFontStyle::kExtraBlack_Weight));
+    }
+
+    const char *value = lua_tostring(L, index);
+    if (!value || strcasecmp(value, "normal") == 0 || strcasecmp(value, "regular") == 0)
+        return SkFontStyle::kNormal_Weight;
+    if (strcasecmp(value, "bold") == 0)
+        return SkFontStyle::kBold_Weight;
+    if (strcasecmp(value, "semibold") == 0 || strcasecmp(value, "demibold") == 0)
+        return SkFontStyle::kSemiBold_Weight;
+    if (strcasecmp(value, "light") == 0)
+        return SkFontStyle::kLight_Weight;
+    return SkFontStyle::kNormal_Weight;
 }
 
 sk_sp<SkImage> load_encoded_image(const char *path)
@@ -664,6 +776,7 @@ void reset_path(lua_skia_frame *frame)
     const SkPathFillType fill_type = frame->path.fillType();
     frame->path = SkPathBuilder(fill_type);
     frame->has_path_matrix = false;
+    frame->has_current = false;
 }
 
 /* Pin the path to the transform in force when its first point is added. */
@@ -686,15 +799,138 @@ void draw_path(lua_skia_frame *frame, const SkPath &path, const SkPaint &paint)
     target->drawPath(path, paint);
 }
 
+/* skia.create_renderer(window, width, height) -- create a Vulkan swapchain
+ * for an existing X11 window. The backend owns its presentation connection;
+ * the temporary connection here only satisfies the C ABI's validation and is
+ * closed immediately after construction. */
+int skia_create_renderer(lua_State *L)
+{
+    const int base = lua_istable(L, 1) ? 1 : 0;
+    const lua_Integer raw_window = luaL_checkinteger(L, base + 1);
+    const lua_Integer raw_width = luaL_checkinteger(L, base + 2);
+    const lua_Integer raw_height = luaL_checkinteger(L, base + 3);
+    if (raw_window <= 0 || static_cast<uint64_t>(raw_window) > UINT32_MAX)
+        return luaL_argerror(L, base + 1, "expected an X11 window id");
+    if (raw_width <= 0 || raw_height <= 0 ||
+        static_cast<uint64_t>(raw_width) > UINT32_MAX ||
+        static_cast<uint64_t>(raw_height) > UINT32_MAX)
+        return luaL_error(L, "renderer dimensions must be positive 32-bit values");
+
+    xcb_connection_t *connection = xcb_connect(nullptr, nullptr);
+    if (!connection || xcb_connection_has_error(connection))
+    {
+        if (connection)
+            xcb_disconnect(connection);
+        lua_pushnil(L);
+        lua_pushliteral(L, "could not connect to the X server for Skia");
+        return 2;
+    }
+
+    char error[256] = {0};
+    awesome_skia_renderer_t *renderer = awesome_skia_renderer_create(
+        connection, static_cast<xcb_window_t>(raw_window),
+        static_cast<uint32_t>(raw_width), static_cast<uint32_t>(raw_height),
+        error, sizeof(error));
+    xcb_disconnect(connection);
+    if (!renderer)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, error[0] ? error : "could not create the Skia renderer");
+        return 2;
+    }
+
+    push_renderer(L, renderer, static_cast<uint32_t>(raw_width),
+                  static_cast<uint32_t>(raw_height));
+    return 1;
+}
+
+int renderer_resize(lua_State *L)
+{
+    auto *renderer = static_cast<lua_skia_renderer *>(
+        luaL_checkudata(L, 1, k_renderer_type));
+    const lua_Integer raw_width = luaL_checkinteger(L, 2);
+    const lua_Integer raw_height = luaL_checkinteger(L, 3);
+    if (!renderer->renderer)
+        return luaL_error(L, "Skia renderer has already been destroyed");
+    if (raw_width <= 0 || raw_height <= 0 ||
+        static_cast<uint64_t>(raw_width) > UINT32_MAX ||
+        static_cast<uint64_t>(raw_height) > UINT32_MAX)
+        return luaL_argerror(L, 2, "renderer dimensions must be positive 32-bit values");
+
+    char error[256] = {0};
+    if (!awesome_skia_renderer_resize(renderer->renderer,
+                                       static_cast<uint32_t>(raw_width),
+                                       static_cast<uint32_t>(raw_height),
+                                       error, sizeof(error)))
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, error[0] ? error : "could not resize the Skia renderer");
+        return 2;
+    }
+    renderer->width = static_cast<uint32_t>(raw_width);
+    renderer->height = static_cast<uint32_t>(raw_height);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+int renderer_destroy(lua_State *L)
+{
+    auto *renderer = static_cast<lua_skia_renderer *>(
+        luaL_checkudata(L, 1, k_renderer_type));
+    if (renderer->renderer)
+    {
+        awesome_skia_renderer_destroy(renderer->renderer);
+        renderer->renderer = nullptr;
+    }
+    return 0;
+}
+
+int renderer_gc(lua_State *L)
+{
+    auto *renderer = static_cast<lua_skia_renderer *>(
+        luaL_checkudata(L, 1, k_renderer_type));
+    if (renderer->renderer)
+    {
+        awesome_skia_renderer_destroy(renderer->renderer);
+        renderer->renderer = nullptr;
+    }
+    renderer->~lua_skia_renderer();
+    return 0;
+}
+
+int renderer_index(lua_State *L)
+{
+    luaL_getmetatable(L, k_renderer_type);
+    lua_pushvalue(L, 2);
+    lua_rawget(L, -2);
+    if (!lua_isnil(L, -1))
+        return 1;
+    lua_pop(L, 2);
+
+    const auto *renderer = static_cast<const lua_skia_renderer *>(
+        luaL_checkudata(L, 1, k_renderer_type));
+    const char *name = luaL_checkstring(L, 2);
+    if (std::strcmp(name, "width") == 0)
+        lua_pushinteger(L, renderer->width);
+    else if (std::strcmp(name, "height") == 0)
+        lua_pushinteger(L, renderer->height);
+    else if (std::strcmp(name, "valid") == 0)
+        lua_pushboolean(L, renderer->renderer != nullptr);
+    else
+        lua_pushnil(L);
+    return 1;
+}
+
 int frame_begin(lua_State *L)
 {
-    auto *renderer = static_cast<awesome_skia_renderer_t *>(lua_touserdata(L, 1));
+    auto *renderer = renderer_from_lua(L, 1);
     if (!renderer)
-        return luaL_argerror(L, 1, "expected drawable.skia_renderer");
+        return luaL_argerror(L, 1, "expected a live Skia renderer");
 
     char error[256] = {0};
     awesome_skia_frame_t *native = awesome_skia_renderer_begin_frame(renderer, error, sizeof(error));
-    if (!native && std::strcmp(error, "Skia frame unavailable") == 0)
+    if (!native && (std::strcmp(error, "Skia frame unavailable") == 0 ||
+                    std::strcmp(error, "Skia surface recovered") == 0))
     {
         lua_pushnil(L);
         lua_pushstring(L, error);
@@ -743,20 +979,26 @@ int skia_stats(lua_State *L)
 }
 
 /* skia.Context(surface) -- cairo.Context. Works for every surface kind: a
- * swapchain surface acquires a frame, a raster surface draws in place. */
+ * swapchain surface acquires a frame, a raster surface draws in place. A
+ * source-only image/surface is copied to a writable raster target, which is
+ * the closest useful equivalent to constructing a Cairo context around a
+ * snapshot returned by an existing config. */
 int skia_context(lua_State *L)
 {
     const int base = lua_istable(L, 1) ? 1 : 0;
     lua_skia_surface *surface = test_surface(L, base + 1);
-    if (!surface)
-        return luaL_argerror(L, base + 1, "expected a skia surface");
+    lua_skia_image *image = test_image(L, base + 1);
+    if (!surface && !image)
+        return luaL_argerror(L, base + 1, "expected a skia surface or image");
 
     awesome_skia_frame_t *native = nullptr;
-    if (surface->renderer)
+    sk_sp<SkSurface> copied;
+    if (surface && surface->renderer)
     {
         char error[256] = {0};
         native = awesome_skia_renderer_begin_frame(surface->renderer, error, sizeof(error));
-        if (!native && std::strcmp(error, "Skia frame unavailable") == 0)
+        if (!native && (std::strcmp(error, "Skia frame unavailable") == 0 ||
+                        std::strcmp(error, "Skia surface recovered") == 0))
         {
             lua_pushnil(L);
             lua_pushstring(L, error);
@@ -765,16 +1007,32 @@ int skia_context(lua_State *L)
         if (!native)
             return luaL_error(L, "could not begin Skia frame: %s", error);
     }
-    else if (!surface->raster && !surface->svg_canvas)
+    else if (surface && surface->raster)
     {
-        return luaL_error(L, "cannot draw into a read-only image surface");
+        /* Draw in the caller-owned raster surface below. */
+    }
+    else if (surface && surface->svg_canvas)
+    {
+        /* Draw in the caller-owned SVG canvas below. */
+    }
+    else
+    {
+        sk_sp<SkImage> source = image ? image->image : surface->image;
+        if (!source)
+            return luaL_error(L, "cannot draw into an empty image surface");
+        copied = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(
+            source->width(), source->height()));
+        if (!copied)
+            return luaL_error(L, "could not create a writable image surface copy");
+        copied->getCanvas()->clear(SK_ColorTRANSPARENT);
+        copied->getCanvas()->drawImage(source, 0, 0, SkSamplingOptions());
     }
 
     auto *context = static_cast<lua_skia_frame *>(lua_newuserdata(L, sizeof(lua_skia_frame)));
     new (context) lua_skia_frame();
     context->frame = native;
-    context->offscreen = surface->raster;
-    context->external_canvas = surface->svg_canvas.get();
+    context->offscreen = surface && surface->raster ? surface->raster : std::move(copied);
+    context->external_canvas = surface && surface->svg_canvas ? surface->svg_canvas.get() : nullptr;
     context->state.paint.setAntiAlias(true);
     context->states.push_back(context->state);
     luaL_getmetatable(L, k_frame_type);
@@ -826,8 +1084,17 @@ int frame_present(lua_State *L)
     awesome_skia_frame_t *native = frame->frame;
     frame->frame = nullptr;
     if (!awesome_skia_renderer_end_frame(native, error, sizeof(error)))
+    {
+        if (std::strcmp(error, "Skia surface recovered") == 0)
+        {
+            lua_pushnil(L);
+            lua_pushstring(L, error);
+            return 2;
+        }
         return luaL_error(L, "could not present Skia frame: %s", error);
-    return 0;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 int frame_needs_full_redraw(lua_State *L)
@@ -1116,9 +1383,15 @@ int frame_clip_extents(lua_State *L)
 int frame_rectangle(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
+    const SkScalar x = luaL_checknumber(L, 2);
+    const SkScalar y = luaL_checknumber(L, 3);
+    const SkScalar width = luaL_checknumber(L, 4);
+    const SkScalar height = luaL_checknumber(L, 5);
     note_path_start(frame);
-    frame->path.addRect(SkRect::MakeXYWH(luaL_checknumber(L, 2), luaL_checknumber(L, 3),
-                                          luaL_checknumber(L, 4), luaL_checknumber(L, 5)));
+    frame->path.addRect(SkRect::MakeXYWH(x, y, width, height));
+    frame->current = {x, y};
+    frame->subpath_start = frame->current;
+    frame->has_current = true;
     return 0;
 }
 
@@ -1128,6 +1401,8 @@ int frame_move_to(lua_State *L)
     note_path_start(frame);
     frame->current = { static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        static_cast<SkScalar>(luaL_checknumber(L, 3)) };
+    frame->subpath_start = frame->current;
+    frame->has_current = true;
     frame->path.moveTo(frame->current);
     frame->force_move_to = false;
     return 0;
@@ -1139,6 +1414,9 @@ int frame_line_to(lua_State *L)
     note_path_start(frame);
     frame->current = { static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        static_cast<SkScalar>(luaL_checknumber(L, 3)) };
+    if (!frame->has_current)
+        frame->subpath_start = frame->current;
+    frame->has_current = true;
     frame->path.lineTo(frame->current);
     return 0;
 }
@@ -1149,6 +1427,8 @@ int frame_rel_move_to(lua_State *L)
     note_path_start(frame);
     frame->current = { frame->current.fX + static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        frame->current.fY + static_cast<SkScalar>(luaL_checknumber(L, 3)) };
+    frame->subpath_start = frame->current;
+    frame->has_current = true;
     frame->path.moveTo(frame->current);
     return 0;
 }
@@ -1159,6 +1439,9 @@ int frame_rel_line_to(lua_State *L)
     note_path_start(frame);
     frame->current = { frame->current.fX + static_cast<SkScalar>(luaL_checknumber(L, 2)),
                        frame->current.fY + static_cast<SkScalar>(luaL_checknumber(L, 3)) };
+    if (!frame->has_current)
+        frame->subpath_start = frame->current;
+    frame->has_current = true;
     frame->path.lineTo(frame->current);
     return 0;
 }
@@ -1173,13 +1456,19 @@ int frame_curve_to(lua_State *L)
     const SkScalar y2 = luaL_checknumber(L, 5);
     frame->current = { static_cast<SkScalar>(luaL_checknumber(L, 6)),
                        static_cast<SkScalar>(luaL_checknumber(L, 7)) };
+    if (!frame->has_current)
+        frame->subpath_start = frame->current;
+    frame->has_current = true;
     frame->path.cubicTo(x1, y1, x2, y2, frame->current.fX, frame->current.fY);
     return 0;
 }
 
 int frame_close_path(lua_State *L)
 {
-    check_frame(L, 1)->path.close();
+    lua_skia_frame *frame = check_frame(L, 1);
+    frame->path.close();
+    if (frame->has_current)
+        frame->current = frame->subpath_start;
     return 0;
 }
 
@@ -1195,7 +1484,9 @@ int frame_new_sub_path(lua_State *L)
 {
     /* Keeps the accumulated path, but detaches the current point so a
      * following arc does not draw a connecting line into it. */
-    check_frame(L, 1)->force_move_to = true;
+    lua_skia_frame *frame = check_frame(L, 1);
+    frame->force_move_to = true;
+    frame->has_current = false;
     return 0;
 }
 
@@ -1233,8 +1524,13 @@ int frame_arc(lua_State *L)
         sweep += 2.0f * static_cast<float>(M_PI);
     if (sweep > 2.0f * static_cast<float>(M_PI))
         sweep = 2.0f * static_cast<float>(M_PI);
+    const bool starts_new_subpath = frame->force_move_to || !frame->has_current;
+    if (starts_new_subpath)
+        frame->subpath_start = {x + radius * std::cos(start),
+                                y + radius * std::sin(start)};
     append_arc(frame, x, y, radius, start, sweep);
     frame->current = { x + radius * std::cos(finish), y + radius * std::sin(finish) };
+    frame->has_current = true;
     return 0;
 }
 
@@ -1252,8 +1548,13 @@ int frame_arc_negative(lua_State *L)
         sweep -= 2.0f * static_cast<float>(M_PI);
     if (sweep < -2.0f * static_cast<float>(M_PI))
         sweep = -2.0f * static_cast<float>(M_PI);
+    const bool starts_new_subpath = frame->force_move_to || !frame->has_current;
+    if (starts_new_subpath)
+        frame->subpath_start = {x + radius * std::cos(start),
+                                y + radius * std::sin(start)};
     append_arc(frame, x, y, radius, start, sweep);
     frame->current = { x + radius * std::cos(finish), y + radius * std::sin(finish) };
+    frame->has_current = true;
     return 0;
 }
 
@@ -1264,6 +1565,7 @@ int frame_fill(lua_State *L)
     paint.setStyle(SkPaint::kFill_Style);
     draw_path(frame, frame->path.detach(), paint);
     frame->has_path_matrix = false;
+    frame->has_current = false;
     return 0;
 }
 
@@ -1283,6 +1585,7 @@ int frame_stroke(lua_State *L)
     paint.setStyle(SkPaint::kStroke_Style);
     draw_path(frame, frame->path.detach(), paint);
     frame->has_path_matrix = false;
+    frame->has_current = false;
     return 0;
 }
 
@@ -1501,19 +1804,148 @@ int frame_set_fill_rule(lua_State *L)
     return 0;
 }
 
+int frame_get_current_point(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    lua_pushnumber(L, frame->has_current ? frame->current.fX : 0);
+    lua_pushnumber(L, frame->has_current ? frame->current.fY : 0);
+    return 2;
+}
+
+int frame_set_font_size(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    frame->state.font_size = std::max(static_cast<SkScalar>(luaL_checknumber(L, 2)), 1.0f);
+    return 0;
+}
+
+int frame_select_font_face(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    frame->state.font_family = luaL_optstring(L, 2, "sans");
+    const auto slant = lua_isnoneornil(L, 3)
+        ? SkFontStyle::kUpright_Slant
+        : font_slant(L, 3);
+    const int weight = lua_isnoneornil(L, 4)
+        ? SkFontStyle::kNormal_Weight
+        : font_weight(L, 4);
+    frame->state.font_style = SkFontStyle(weight, SkFontStyle::kNormal_Width, slant);
+    return 0;
+}
+
+int frame_get_font_face(lua_State *L)
+{
+    const lua_skia_frame *frame = check_frame(L, 1);
+    lua_newtable(L);
+    lua_pushstring(L, frame->state.font_family.c_str());
+    lua_setfield(L, -2, "family");
+    lua_pushstring(L, frame->state.font_style.slant() == SkFontStyle::kItalic_Slant
+        ? "italic"
+        : frame->state.font_style.slant() == SkFontStyle::kOblique_Slant
+            ? "oblique" : "normal");
+    lua_setfield(L, -2, "slant");
+    lua_pushstring(L, frame->state.font_style.weight() >= SkFontStyle::kBold_Weight
+        ? "bold" : "normal");
+    lua_setfield(L, -2, "weight");
+    return 1;
+}
+
+int frame_set_font_face(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    if (lua_isstring(L, 2))
+    {
+        frame->state.font_family = lua_tostring(L, 2);
+        return 0;
+    }
+    luaL_checktype(L, 2, LUA_TTABLE);
+
+    lua_getfield(L, 2, "family");
+    if (!lua_isnil(L, -1))
+        frame->state.font_family = luaL_checkstring(L, -1);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "slant");
+    const auto slant = lua_isnil(L, -1)
+        ? frame->state.font_style.slant() : font_slant(L, -1);
+    lua_pop(L, 1);
+
+    lua_getfield(L, 2, "weight");
+    const int weight = lua_isnil(L, -1)
+        ? frame->state.font_style.weight() : font_weight(L, -1);
+    lua_pop(L, 1);
+
+    frame->state.font_style = SkFontStyle(weight, SkFontStyle::kNormal_Width, slant);
+    return 0;
+}
+
+int frame_text_extents(lua_State *L)
+{
+    lua_skia_frame *frame = check_frame(L, 1);
+    size_t length = 0;
+    const char *text = luaL_checklstring(L, 2, &length);
+    SkFont font = text_font(frame);
+    SkRect bounds = SkRect::MakeEmpty();
+    const SkScalar advance = font.measureText(text, length, SkTextEncoding::kUTF8, &bounds);
+    SkFontMetrics metrics;
+    font.getMetrics(&metrics);
+
+    /* Cairo's text extents are in user coordinates and expose the glyph
+     * bounds separately from the advance. SkFont supplies the same two
+     * pieces; use the font metrics for an empty/whitespace-only string where
+     * there is no glyph bounds to report. */
+    const SkScalar x_bearing = bounds.isEmpty() ? 0 : bounds.left();
+    const SkScalar y_bearing = bounds.isEmpty() ? metrics.fAscent : bounds.top();
+    const SkScalar width = bounds.isEmpty() ? 0 : bounds.width();
+    const SkScalar height = bounds.isEmpty() ? metrics.fDescent - metrics.fAscent
+                                             : bounds.height();
+
+    lua_newtable(L);
+    lua_pushnumber(L, x_bearing);
+    lua_setfield(L, -2, "x_bearing");
+    lua_pushnumber(L, y_bearing);
+    lua_setfield(L, -2, "y_bearing");
+    lua_pushnumber(L, width);
+    lua_setfield(L, -2, "width");
+    lua_pushnumber(L, height);
+    lua_setfield(L, -2, "height");
+    lua_pushnumber(L, advance);
+    lua_setfield(L, -2, "x_advance");
+    lua_pushnumber(L, 0);
+    lua_setfield(L, -2, "y_advance");
+    return 1;
+}
+
 int frame_show_text(lua_State *L)
 {
     lua_skia_frame *frame = check_frame(L, 1);
     size_t length = 0;
     const char *text = luaL_checklstring(L, 2, &length);
-    const char *family = luaL_optstring(L, 5, "sans");
-    const float size = static_cast<float>(luaL_optnumber(L, 6, 12));
-    sk_sp<SkTypeface> typeface;
-    if (sk_sp<SkFontMgr> manager = font_manager())
-        typeface = manager->matchFamilyStyle(family, SkFontStyle());
-    SkFont font(typeface, std::max(size, 1.0f));
-    canvas(frame)->drawString(text, luaL_checknumber(L, 3), luaL_checknumber(L, 4),
-                              font, frame->state.paint);
+    const bool has_position = !lua_isnoneornil(L, 3) && !lua_isnoneornil(L, 4);
+    const SkScalar x = has_position ? luaL_checknumber(L, 3)
+                                    : (frame->has_current ? frame->current.fX : 0);
+    const SkScalar y = has_position ? luaL_checknumber(L, 4)
+                                    : (frame->has_current ? frame->current.fY : 0);
+
+    /* The optional family/size arguments are an Awesome/Skia extension used
+     * by the debug overlay. The no-extra-arguments form is the Cairo API used
+     * by piechart, Bling and older user widgets. */
+    SkFont font = text_font(frame);
+    if (!lua_isnoneornil(L, 5) || !lua_isnoneornil(L, 6))
+    {
+        const char *family = luaL_optstring(L, 5, frame->state.font_family.c_str());
+        const SkScalar size = std::max(static_cast<SkScalar>(luaL_optnumber(
+            L, 6, frame->state.font_size)), 1.0f);
+        sk_sp<SkTypeface> typeface;
+        if (sk_sp<SkFontMgr> manager = font_manager())
+            typeface = manager->matchFamilyStyle(family, frame->state.font_style);
+        font = SkFont(typeface, size);
+        font.setSubpixel(true);
+    }
+
+    SkPaint paint = frame->state.paint;
+    paint.setStyle(SkPaint::kFill_Style);
+    canvas(frame)->drawString(text, x, y, font, paint);
     return 0;
 }
 
@@ -1693,6 +2125,7 @@ void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
      * glyph positions in a deliberately bounded cache. The hash makes pointer
      * reuse after a Pango relayout safe. */
     static std::unordered_map<const PangoGlyphString *, cached_text_blob_t> blob_cache;
+    const bool cache_blob = !frame->offscreen;
 
     PangoFont *font = run->item->analysis.font;
     const int count = run->glyphs->num_glyphs;
@@ -1721,9 +2154,12 @@ void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
     }
 
     sk_sp<SkTextBlob> blob;
-    const auto cached = blob_cache.find(run->glyphs);
-    if (cached != blob_cache.end() && cached->second.hash == hash)
-        blob = cached->second.blob;
+    if (cache_blob)
+    {
+        const auto cached = blob_cache.find(run->glyphs);
+        if (cached != blob_cache.end() && cached->second.hash == hash)
+            blob = cached->second.blob;
+    }
 
     if (!blob)
     {
@@ -1764,9 +2200,12 @@ void draw_pango_glyph_run(lua_skia_frame *frame, PangoGlyphItem *run,
         blob = builder.make();
         if (!blob)
             return;
-        if (blob_cache.size() >= 2048)
-            blob_cache.clear();
-        blob_cache[run->glyphs] = {hash, blob};
+        if (cache_blob)
+        {
+            if (blob_cache.size() >= 2048)
+                blob_cache.clear();
+            blob_cache[run->glyphs] = {hash, blob};
+        }
     }
 
     canvas(frame)->drawTextBlob(blob, origin_x, baseline_y, paint);
@@ -2294,9 +2733,12 @@ int surface_write_to_png(lua_State *L)
 {
     auto *surface = static_cast<lua_skia_surface *>(luaL_checkudata(L, 1, k_surface_type));
     const char *path = luaL_checkstring(L, 2);
-    sk_sp<SkImage> image = surface_source(surface);
     SkPixmap pixmap;
-    if (!image || !image->peekPixels(&pixmap))
+    if (surface->raster)
+        surface->raster->peekPixels(&pixmap);
+    else if (sk_sp<SkImage> image = surface_source(surface))
+        image->peekPixels(&pixmap);
+    if (!pixmap.addr())
         return luaL_error(L, "surface has no readable pixels for '%s'", path);
     SkFILEWStream stream(path);
     if (!stream.isValid() || !SkPngEncoder::Encode(&stream, pixmap, SkPngEncoder::Options()))
@@ -2353,7 +2795,23 @@ int frame_snapshot(lua_State *L)
     if (!frame->offscreen)
         return luaL_error(L, "snapshot() only applies to an offscreen image surface "
                              "(created with skia.new_image_surface)");
-    push_image(L, frame->offscreen->makeImageSnapshot());
+    const int width = frame->offscreen->width();
+    const int height = frame->offscreen->height();
+    const size_t stride = static_cast<size_t>(width) * 4;
+    std::vector<uint8_t> pixels(stride * static_cast<size_t>(height));
+    const SkImageInfo info = SkImageInfo::Make(
+        width, height, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
+    if (!frame->offscreen->readPixels(info, pixels.data(), stride, 0, 0))
+        return luaL_error(L, "Skia could not read the offscreen surface");
+    /* A raster surface may finish deferred text work while servicing the
+     * first readback; repeat it so the returned copy contains that work. */
+    if (!frame->offscreen->readPixels(info, pixels.data(), stride, 0, 0))
+        return luaL_error(L, "Skia could not read the offscreen surface");
+    sk_sp<SkData> data = SkData::MakeWithCopy(pixels.data(), pixels.size());
+    sk_sp<SkImage> image = SkImages::RasterFromData(info, std::move(data), stride);
+    if (!image)
+        return luaL_error(L, "Skia could not create an image from the offscreen surface");
+    push_image(L, std::move(image));
     frame->offscreen.reset();
     return 1;
 }
@@ -2406,6 +2864,15 @@ int image_get_height(lua_State *L)
     return 1;
 }
 
+/* Cairo surfaces expose finish(), and older config code sometimes calls it
+ * after using a snapshot as a temporary source. Skia images are immutable and
+ * reference-counted, so there is no resource to release eagerly. */
+int image_finish(lua_State *L)
+{
+    luaL_checkudata(L, 1, k_image_type);
+    return 0;
+}
+
 /* Write the image out as a PNG. Intended for tests and for eyeballing what a
  * widget actually rendered during the Cairo migration. */
 int image_save_png(lua_State *L)
@@ -2425,6 +2892,32 @@ int image_save_png(lua_State *L)
     if (!SkPngEncoder::Encode(&stream, pixmap, SkPngEncoder::Options()))
         return luaL_error(L, "could not encode PNG '%s'", path);
     return 0;
+}
+
+/* image:to_rgba() -- return a tightly packed, unpremultiplied RGBA copy.
+ * Awexygen uses this as its Cairo-free GTK3 presentation bridge: Skia owns the
+ * frame, while GtkImage/GdkPixbuf owns the final host presentation. */
+int image_to_rgba(lua_State *L)
+{
+    auto *image = static_cast<lua_skia_image *>(luaL_checkudata(L, 1, k_image_type));
+    if (!image->image)
+        return luaL_error(L, "Skia image has no pixel data");
+
+    const int width = image->image->width();
+    const int height = image->image->height();
+    const size_t stride = static_cast<size_t>(width) * 4;
+    std::vector<uint8_t> pixels(stride * static_cast<size_t>(height));
+    if (!image->image->readPixels(
+            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType,
+                              kUnpremul_SkAlphaType),
+            pixels.data(), stride, 0, 0))
+        return luaL_error(L, "Skia could not read image pixels as RGBA");
+
+    lua_pushlstring(L, reinterpret_cast<const char *>(pixels.data()), pixels.size());
+    lua_pushinteger(L, width);
+    lua_pushinteger(L, height);
+    lua_pushinteger(L, static_cast<lua_Integer>(stride));
+    return 4;
 }
 
 int image_gc(lua_State *L)
@@ -2470,6 +2963,7 @@ int image_index(lua_State *L)
 
 int frame_index(lua_State *L)
 {
+    const lua_skia_frame *frame = check_frame(L, 1);
     luaL_getmetatable(L, k_frame_type);
     lua_pushvalue(L, 2);
     lua_rawget(L, -2);
@@ -2487,6 +2981,13 @@ int frame_index(lua_State *L)
         push_matrix_table(L, canvas(check_frame(L, 1))->getTotalMatrix());
         return 1;
     }
+    if (std::strcmp(name, "font_size") == 0)
+    {
+        lua_pushnumber(L, frame->state.font_size);
+        return 1;
+    }
+    if (std::strcmp(name, "font_face") == 0)
+        return frame_get_font_face(L);
     lua_pushnil(L);
     return 1;
 }
@@ -2509,6 +3010,17 @@ int frame_newindex(lua_State *L)
     {
         frame->state.paint.setStrokeWidth(luaL_checknumber(L, 3));
         return 0;
+    }
+    if (std::strcmp(name, "font_size") == 0)
+    {
+        frame->state.font_size = std::max(static_cast<SkScalar>(luaL_checknumber(L, 3)), 1.0f);
+        return 0;
+    }
+    if (std::strcmp(name, "font_face") == 0)
+    {
+        lua_pushvalue(L, 3);
+        lua_replace(L, 2);
+        return frame_set_font_face(L);
     }
     return luaL_error(L, "Skia canvas has no writable '%s' property", name);
 }
@@ -2759,6 +3271,8 @@ int pattern_newindex(lua_State *L)
 
 void set_method(lua_State *L, const char *name, lua_CFunction method)
 {
+    if (!lua_istable(L, -1))
+        luaL_error(L, "Skia Lua registration lost its table while adding %s", name);
     lua_pushcfunction(L, method);
     lua_setfield(L, -2, name);
 }
@@ -2768,6 +3282,8 @@ void set_method(lua_State *L, const char *name, lua_CFunction method)
 void set_enum_table(lua_State *L, const char *name,
                     std::initializer_list<std::pair<const char *, int>> values)
 {
+    if (!lua_istable(L, -1))
+        luaL_error(L, "Skia Lua registration lost its namespace while adding %s", name);
     lua_newtable(L);
     for (const auto &entry : values)
     {
@@ -2886,9 +3402,16 @@ extern "C" bool awesome_skia_alpha_mask_from_lua(lua_State *L, int index,
     return true;
 }
 
-extern "C" void awesome_skia_lua_extend(lua_State *L)
+void register_skia_lua(lua_State *L, int skia_index)
 {
-    luaL_getmetatable(L, k_frame_type);
+    luaL_newmetatable(L, k_renderer_type);
+    set_method(L, "__gc", renderer_gc);
+    set_method(L, "__index", renderer_index);
+    set_method(L, "resize", renderer_resize);
+    set_method(L, "destroy", renderer_destroy);
+    lua_pop(L, 1);
+
+    luaL_newmetatable(L, k_frame_type);
     set_method(L, "__gc", frame_gc);
     set_method(L, "__index", frame_index);
     set_method(L, "__newindex", frame_newindex);
@@ -2920,6 +3443,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "rel_move_to", frame_rel_move_to);
     set_method(L, "rel_line_to", frame_rel_line_to);
     set_method(L, "curve_to", frame_curve_to);
+    set_method(L, "get_current_point", frame_get_current_point);
     set_method(L, "arc", frame_arc);
     set_method(L, "arc_negative", frame_arc_negative);
     set_method(L, "close_path", frame_close_path);
@@ -2945,6 +3469,11 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "mask", frame_mask);
     set_method(L, "set_fill_rule", frame_set_fill_rule);
     set_method(L, "set_operator", frame_set_operator);
+    set_method(L, "set_font_size", frame_set_font_size);
+    set_method(L, "select_font_face", frame_select_font_face);
+    set_method(L, "get_font_face", frame_get_font_face);
+    set_method(L, "set_font_face", frame_set_font_face);
+    set_method(L, "text_extents", frame_text_extents);
     set_method(L, "show_text", frame_show_text);
     set_method(L, "show_layout", frame_show_layout);
     set_method(L, "draw_image", frame_draw_image);
@@ -2960,9 +3489,11 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "__gc", image_gc);
     set_method(L, "__index", image_index);
     set_method(L, "save_png", image_save_png);
+    set_method(L, "to_rgba", image_to_rgba);
     /* Cairo surface spelling, so call sites that measure an icon work. */
     set_method(L, "get_width", image_get_width);
     set_method(L, "get_height", image_get_height);
+    set_method(L, "finish", image_finish);
     lua_pop(L, 1);
 
     /* A picture has no methods of its own (it is only ever passed back into
@@ -3006,7 +3537,7 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "finish", surface_finish);
     lua_pop(L, 1);
 
-    lua_getglobal(L, "skia");
+    lua_pushvalue(L, skia_index);
 
     /* Cairo-shaped namespace. Call sites keep the spelling they already use,
      * so porting a config is a require swap rather than a rewrite. */
@@ -3059,6 +3590,9 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     lua_setfield(L, -2, "EVEN_ODD");
     lua_setfield(L, -2, "FillRule");
 
+    set_method(L, "create_renderer", skia_create_renderer);
+    /* Explicit alias for callers that want to document the current WSI. */
+    set_method(L, "create_xcb_renderer", skia_create_renderer);
     set_method(L, "begin", frame_begin);
     set_method(L, "stats", skia_stats);
     set_method(L, "is_canvas", skia_is_canvas);
@@ -3083,5 +3617,18 @@ extern "C" void awesome_skia_lua_extend(lua_State *L)
     set_method(L, "create_for_surface", pattern_create_for_surface);
     set_method(L, "is_type_of", pattern_is_type_of);
     lua_setfield(L, -2, "Pattern");
+}
+
+extern "C" void awesome_skia_lua_extend(lua_State *L)
+{
+    lua_getglobal(L, "skia");
+    register_skia_lua(L, lua_gettop(L));
     lua_pop(L, 1);
+}
+
+extern "C" int awesome_skia_lua_open(lua_State *L)
+{
+    lua_newtable(L);
+    register_skia_lua(L, lua_gettop(L));
+    return 1;
 }

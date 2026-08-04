@@ -703,7 +703,8 @@ function hierarchy:draw(context, cr)
         -- skia.new_picture_recorder is checked as the guard for whether the
         -- backend supports this at all (nil under the lgi.cairo test
         -- double), same pattern as cr.push_group above.
-        if self._nothing_changed and skia.new_picture_recorder then
+        if self._nothing_changed and skia.new_picture_recorder and
+                not context._full_content_repaint then
             if not self._picture_valid then
                 self._picture = record_picture(self, context, widget, self_width, self_height,
                     ext_x, ext_y, ext_width, ext_height, cr)

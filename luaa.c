@@ -1424,18 +1424,22 @@ luaA_init(xdgHandle* xdg, string_array_t *searchpath)
 
     /* add Lua search paths */
     lua_getglobal(L, "package");
-    if (LUA_TTABLE != lua_type(L, 1))
+    /* Initialization helpers may leave implementation values on the Lua
+     * stack. Do not assume that `package` is stack slot 1: doing so skips all
+     * configured search paths when the Skia Lua extension is enabled. */
+    const int package_index = lua_gettop(L);
+    if (LUA_TTABLE != lua_type(L, package_index))
     {
         warn("package is not a table");
         return;
     }
-    lua_getfield(L, 1, "path");
+    lua_getfield(L, package_index, "path");
     add_to_search_path(L, searchpath, true);
-    lua_setfield(L, 1, "path"); /* package.path = "concatenated string" */
+    lua_setfield(L, package_index, "path"); /* package.path = "concatenated string" */
 
-    lua_getfield(L, 1, "cpath");
+    lua_getfield(L, package_index, "cpath");
     add_to_search_path(L, searchpath, false);
-    lua_setfield(L, 1, "cpath"); /* package.cpath = "concatenated string" */
+    lua_setfield(L, package_index, "cpath"); /* package.cpath = "concatenated string" */
 
     lua_pop(L, 1); /* pop "package" */
 }

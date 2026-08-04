@@ -496,9 +496,11 @@ luaA_systray_surface(lua_State *L)
         for (int x = 0; x < width; x++) {
             uint32_t pixel;
             memcpy(&pixel, data + y * stride + x * 4, sizeof(pixel));
-            /* Systray's XRGB visual has no alpha byte; its contents are
-             * opaque unless an embedded client supplied a composited alpha. */
-            pixels[y * width + x] = pixel | 0xff000000u;
+            /* In composited mode the tray uses the 32-bit ARGB visual. Keep
+             * its alpha channel: the tray window's transparent backing must
+             * remain transparent so wibox.widget.systray can paint
+             * beautiful.bg_systray underneath it. */
+            pixels[y * width + x] = pixel;
         }
     awesome_skia_image_t *image = draw_image_from_data(width, height, pixels);
     p_delete(&pixels);

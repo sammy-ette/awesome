@@ -167,6 +167,25 @@ event_emit_button(lua_State *L, xcb_button_press_event_t *ev)
     luaA_object_emit_signal(L, -5, name, 4);
 }
 
+/* Titlebars are real child windows in the Skia backend, but they deliberately
+ * let button events propagate to the client frame (the frame owns Awesome's
+ * input selection).  A propagated event therefore has event == frame_window
+ * and child == titlebar_window.  Keep that case distinct from the duplicate
+ * event generated for the actual client window below. */
+static bool
+client_event_is_titlebar_child(client_t *c, xcb_window_t window)
+{
+    if (window == XCB_NONE)
+        return false;
+
+    for (client_titlebar_t bar = CLIENT_TITLEBAR_TOP;
+         bar < CLIENT_TITLEBAR_COUNT; bar++)
+        if (c->titlebar[bar].window == window)
+            return true;
+
+    return false;
+}
+
 /** The button press event handler.
  * \param ev The event.
  */
@@ -230,11 +249,17 @@ event_handle_button(xcb_button_press_event_t *ev)
     }
     else if((c = client_getbyframewin(ev->event)) || (c = client_getbywin(ev->event)))
     {
+        const bool titlebar_child =
+            ev->event == c->frame_window &&
+            client_event_is_titlebar_child(c, ev->child);
+
         /* For clicks inside of c->window, we get two events. Once because of a
          * passive grab on c->window and then again for c->frame_window.
-         * Ignore the second event (identifiable by ev->child != XCB_NONE).
+         * Ignore the second event (identifiable by ev->child != XCB_NONE), but
+         * do not discard a titlebar event: titlebars are also children of the
+         * frame in the Skia backend and intentionally propagate their input.
          */
-        if (ev->event != c->frame_window || ev->child == XCB_NONE)
+        if (ev->event != c->frame_window || ev->child == XCB_NONE || titlebar_child)
         {
             luaA_object_push(L, c);
             if (c->window == ev->event)

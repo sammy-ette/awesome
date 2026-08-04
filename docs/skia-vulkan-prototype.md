@@ -18,6 +18,16 @@ frame:present()
 `frame` is a GPU frame: it cannot be presented twice, and its garbage collector
 path closes an abandoned frame safely.
 
+The same implementation can be loaded outside the Awesome executable as a
+native Lua module (`skia.so`). This is the integration point used by the
+vendored Awexygen runtime: GTK3 remains its window/event host, but Skia owns
+the rasterization and Vulkan presentation directly into the X11 child window.
+Awexygen does not use a Cairo presentation bridge or expose a Cairo canvas to
+its renderer. Set `AWESOMEWM_SKIA_MODULE_DIR` to the directory containing the
+module when launching Awexygen. The module must match the launcher's Lua ABI;
+for example, a module built against Lua 5.4 cannot be loaded by a Lua 5.1
+interpreter.
+
 ## Build and install
 
 From the AwesomeWM repository, run:
@@ -128,6 +138,54 @@ vector logo code) work through `wibox.widget.imagebox`. `drawable:set_bgimage`
 also accepts a file path directly under Skia. Arbitrary Cairo-surface/RSVG
 backgrounds are still unsupported since they need the same rasterize bridge
 but aren't the common case.
+
+## Porting existing configs
+
+The lowest-risk migration boundary is the Cairo-shaped Lua canvas. Existing
+`cr:rectangle()`, `cr:clip()`, `cr:set_source_surface()`, `cr:paint()`, and
+similar calls can continue to work; use the native `skia` namespace only for
+surface construction and let the renderer choose the implementation:
+
+```lua
+local drawing = rawget(_G, "skia") or require("lgi").cairo
+
+local surface = drawing.ImageSurface.create(
+    drawing.Format.ARGB32, width, height)
+local cr = drawing.Context(surface)
+```
+
+On this build the first branch selects Skia. On a stock Awesome installation
+the second branch preserves the original LGI Cairo behavior. The Skia canvas
+also provides the common Cairo toy-text calls used by older widgets:
+`get_current_point`, `set_font_size`, `select_font_face`, `get_font_face`,
+`set_font_face`, `text_extents`, and `show_text`.
+When legacy code constructs a context around a source-only Skia image, the
+binding uses a writable raster copy, so thumbnail code can keep its existing
+`Context(content)` flow.
+
+Invalidation regions are not pixel surfaces, so code that creates
+`cairo.Region`/`cairo.RectangleInt` values should use the renderer-neutral
+`gears.region` API instead:
+
+```lua
+local region = require("gears.region").new()
+region:union_rectangle { x = x, y = y, width = width, height = height }
+```
+
+Do not require a private `_native` field on Skia surfaces. Pass the Skia
+surface or image directly; the client, imagebox, and drawing bindings accept
+those objects. If one line must run on both backends, an explicit compatibility
+fallback such as `img._native or img` is appropriate. Genuine Cairo
+interop—GDK/RSVG/PangoCairo objects, raw `cairo_surface_t*` access, and Cairo
+data-buffer APIs—still needs to remain in an isolated Cairo-only component
+until an explicit bridge is added.
+
+The Awexygen adapter intentionally does not provide that bridge. GTK3 is
+retained internally for lifecycle, input, and optional wrapped GTK widgets,
+and its own implementation may use Cairo internally, but no Awexygen runtime
+module imports `lgi.cairo` or constructs a Cairo object. Shape masks are still
+stored for API compatibility and visual clipping remains in the Skia widget
+tree; native X Shape/input-mask integration is follow-up work.
 
 ## Current Skia compatibility
 
