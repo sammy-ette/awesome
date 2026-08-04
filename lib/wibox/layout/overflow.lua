@@ -456,10 +456,14 @@ function overflow:before_draw_children(context, cr, width, height)
         local sizing = self._private._sizing_cache
         local content_x = sizing and sizing.widget_x or 0
         local content_y = sizing and sizing.widget_y or 0
-        local content_w = sizing and sizing.width or width
-        local content_h = sizing and sizing.height or height
-
         local is_y = self._private.dir == "y"
+        -- The sizing cache keeps `height = math.huge` for a vertical
+        -- overflow so children can report their unconstrained sizes. That
+        -- value is not a drawable clip. Use the finite viewport dimension
+        -- for the shift bounds and keep the scrollbar-excluded width/height
+        -- from the cache where it is finite.
+        local content_w = is_y and (sizing and sizing.width or width) or width
+        local content_h = is_y and height or (sizing and sizing.height or height)
         local dx = is_y and 0 or shift_amount
         local dy = is_y and shift_amount or 0
 

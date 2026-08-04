@@ -48,13 +48,11 @@ local MIN_FRAME_INTERVAL = 1 / target_fps
 -- Deliberate under-shoot, because deferring a redraw goes through
 -- `gears.timer`, which quantizes its timeout to whole milliseconds
 -- (`gmath.round(timeout * 1000)`). At 60fps the interval is 16.667ms, so a
--- wait computed to land exactly on it rounds *up* to 17ms -- the pacer would
--- then be the very thing preventing the frame rate it is trying to hold,
--- capping at 58.8fps no matter how fast everything else got. Subtracting a
--- 2ms slack means a frame that is ready near the target is let through
--- immediately rather than pushed into the next millisecond bucket; bursts
--- much faster than the target are still coalesced, which is the actual job.
-local FRAME_PACING_SLACK = 0.002
+-- wait computed to land exactly on it rounds *up* to 17ms. Raster
+-- presentation can already consume most of the frame budget, so leave enough
+-- slack that it falls through to the idle path instead of adding another
+-- rounded timeout. Fast invalidation bursts are still coalesced here.
+local FRAME_PACING_SLACK = 0.008
 
 local function defer_redraw(self)
     if self._frame_retry_pending then return end
@@ -129,6 +127,7 @@ local function do_redraw(self)
     self._last_redraw_start_time = monotonic_seconds()
 
     local raster = self.drawable.skia_raster
+    local raster_retained = raster and self.drawable.skia_raster_retained
     local renderer = raster and true or self.drawable.skia_renderer
     if not raster and not renderer then
         -- A drawable with no area gets no renderer; there is nothing to draw.
@@ -155,10 +154,12 @@ local function do_redraw(self)
         error("Skia/Vulkan could not begin a drawable frame: " ..
             tostring(begin_error))
     end
-    -- The standalone raster adapter creates a fresh CPU surface for each
+    -- A non-retained raster adapter creates a fresh CPU surface for each
     -- frame. Its snapshot is intentionally consumptive, so never replay an
-    -- unpainted surface when the Lua widget tree has no new damage.
-    if raster then
+    -- unpainted surface when the Lua widget tree has no new damage. Retained
+    -- adapters keep the surface (and its pixels) between frames, which lets
+    -- the normal dirty-region and picture-cache paths do their job.
+    if raster and not raster_retained then
         self._need_complete_repaint = true
     end
     local context = get_widget_context(self)
@@ -228,6 +229,17 @@ local function do_redraw(self)
     end
     self._dirty_area = region.new()
 
+    -- A host does not need a new pixel upload for a move/expose redraw when
+    -- the retained raster image is already presented. Keep this
+    -- check after hierarchy/context maintenance: those can discover a new
+    -- screen/DPI context and set _need_complete_repaint themselves.
+    if raster_retained and not content_invalid and
+            self.drawable.has_skia_raster_content and
+            self.drawable:has_skia_raster_content() then
+        self.drawable:refresh()
+        return
+    end
+
     if content_invalid then
         cr:mark_content_repaint()
         -- Saved so the overlay below can draw outside whatever clip the
@@ -238,13 +250,24 @@ local function do_redraw(self)
         -- have valid pixels for rows that become visible.
         cr:clip_rect(0, 0, width, height)
 
-        -- A layout signal or a full-repaint trigger can invalidate the cache
-        -- without leaving a matching dirty rectangle (e.g. a same-size
-        -- reorder), so only take the partial path when the region is both
-        -- present and trusted to cover everything that changed.
-        local partial = not forced_content_repaint and not layout_invalidated
+        -- A full-repaint trigger can invalidate the cache without leaving a
+        -- matching dirty rectangle, so only take the partial path when the
+        -- region is present and trusted to cover everything that changed.
+        -- Retained raster drawables can also use a layout's old/new damage:
+        -- this is what lets wibox.layout.overflow shift its existing pixels
+        -- during scroll instead of repainting the entire page. The retained
+        -- surface remains correct because hierarchy:update() unions both
+        -- sides of every moved node into this region.
+        local layout_requires_full = layout_invalidated and
+            (not raster_retained or dirty_region:is_empty())
+        local partial = not forced_content_repaint and not layout_requires_full
 
-        if partial then
+        -- A retained raster layout can have a large old/new damage union
+        -- during scrolling. wibox.layout.overflow uses that union to prove
+        -- that its existing pixels cover the moving content, then shifts the
+        -- cache and repaints only the exposed edge. Do not turn that useful
+        -- layout damage back into a full repaint based on its area.
+        if partial and not (raster_retained and layout_invalidated) then
             -- Many small clipped passes cost more than one full repaint once
             -- the dirty region covers most of the surface or has fragmented
             -- into a lot of rectangles; bail out to the full path instead.
@@ -311,7 +334,6 @@ local function do_redraw(self)
             draw_debug_overlay(self, cr)
         end
     end
-
     local presented, present_error
     if raster then
         local image = cr:snapshot()

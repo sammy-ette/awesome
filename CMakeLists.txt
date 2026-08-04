@@ -110,7 +110,8 @@ enable_language(CXX)
 
     add_library(awesome-skia-renderer STATIC
         ${SOURCE_DIR}/render/skia/skia_backend.cc
-        ${SOURCE_DIR}/render/skia/skia_lua.cc)
+        ${SOURCE_DIR}/render/skia/skia_lua.cc
+        ${SOURCE_DIR}/render/skia/skia_xcb_lua.cc)
     # The same implementation archive is also consumed by the standalone
     # Lua module used by Awexygen, so its objects must be usable from a shared
     # module as well as from the Awesome executable.
@@ -149,7 +150,11 @@ enable_language(CXX)
     target_compile_options(skia PRIVATE -std=c++20 -Wall -Wextra -Wpedantic)
     target_link_libraries(skia PRIVATE
         awesome-skia-renderer
-        ${LUA_LIBRARIES})
+        ${LUA_LIBRARIES}
+        xcb-randr
+        xcb-xkb
+        xkbcommon-x11
+        xkbcommon)
     set_target_properties(skia PROPERTIES
         PREFIX ""
         OUTPUT_NAME "skia")

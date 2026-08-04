@@ -319,10 +319,10 @@ changed upstream).
    cache dropped), moved-only (position changed, content didn't —
    `_moved_only = true`), and truly nothing changed — neither position nor
    content (`_nothing_changed = true`, new). `hierarchy:draw()` (line ~696)
-   checks the last case: if `skia.new_picture_recorder` exists (guards the
-   `lgi.cairo` test stub, which lacks it) and the node's cached `_picture` is
-   still valid, it replays the cached picture (`cr:draw_picture`) instead of
-   walking the widget's `draw()`/`before_draw_children`/children chain again.
+   replays the cached picture (`cr:draw_picture`) when the node is unchanged,
+   or when it is a shift-eligible overflow row that only moved. This avoids
+   walking the row's widget, Pango and icon draw chain on every app-list
+   scroll frame.
    The picture is (re)built via `record_picture()` (line 625), a local
    function that opens a `skia.new_picture_recorder(w, h, template_cr)`,
    translates to the node's extents origin, and records through the same
@@ -353,12 +353,8 @@ changed upstream).
    calling the underlying widgets' `draw()` again, (b) a redraw-only signal
    invalidates the cache and forces a real re-record, (c) the template
    frame's paint state round-trips through the recorder unchanged.
-   Deliberately **not** extended to `_moved_only` nodes yet (that's
-   `overflow.lua`'s shift-blit's job for its own specific case, item 1 above)
-   — broadening this to cover movement generally, right after two real bugs
-   already came out of this exact feature area in one session, is exactly
-   the kind of scope creep likely to produce a third one. Left as a
-   deliberate follow-up, not to be picked up without being asked.
+   Moved-only replay is deliberately limited to shift-eligible overflow rows.
+   General moving nodes still use the normal draw path.
 3. **Fewer Lua↔C crossings per node.** `hierarchy:draw()`'s per-node entry
    and exit used to be five separate calls into the C canvas binding every
    frame, per node: `save()`, `transform()`, an `intersects_clip()` helper

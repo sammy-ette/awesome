@@ -75,9 +75,10 @@ local function hierarchy_new(redraw_callback, layout_callback, callback_arg)
         _shift_eligible = false,
         -- Whether this exact update found widget/context/size AND position
         -- all identical to last time -- strictly stronger than _moved_only,
-        -- which allows position to differ. This is the condition under
+        -- which allows position to differ. This is the normal condition under
         -- which a recorded picture of this node's content is valid to
-        -- replay: nothing that could affect what it draws has changed.
+        -- replay. Overflow rows also replay that picture when only their
+        -- position changed.
         -- General and not opt-in (unlike _shift_eligible), since replaying
         -- a picture instead of re-running :draw() is safe for any widget
         -- once its content is provably unchanged, not just ones a specific
@@ -695,16 +696,17 @@ function hierarchy:draw(context, cr)
 
         -- _nothing_changed (from hierarchy_update() above) is strictly
         -- stronger than _moved_only: widget, context, size AND position are
-        -- all identical to last time, not just content. That is exactly the
-        -- condition under which a recorded picture is valid to replay
-        -- instead of re-running every widget's :draw() in this subtree --
-        -- general and not opt-in, unlike the shift-blit skip above, since it
-        -- does not depend on any parent having coordinated a pixel shift.
+        -- all identical to last time, not just content. An overflow row can
+        -- also be _moved_only: its content is unchanged, but scrolling moved
+        -- its placement. Overflow marks those rows as shift-eligible, so the
+        -- same local picture is valid under the row's new transform. This
+        -- avoids rerunning Lua, Pango and icon drawing for every visible app
+        -- on every scroll frame.
         -- skia.new_picture_recorder is checked as the guard for whether the
         -- backend supports this at all (nil under the lgi.cairo test
         -- double), same pattern as cr.push_group above.
-        if self._nothing_changed and skia.new_picture_recorder and
-                not context._full_content_repaint then
+        local moved_picture = self._moved_only and self._shift_eligible
+        if (self._nothing_changed or moved_picture) and skia.new_picture_recorder then
             if not self._picture_valid then
                 self._picture = record_picture(self, context, widget, self_width, self_height,
                     ext_x, ext_y, ext_width, ext_height, cr)

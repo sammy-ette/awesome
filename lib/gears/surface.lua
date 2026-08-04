@@ -10,7 +10,6 @@ local setmetatable = setmetatable
 local type = type
 local capi = { awesome = awesome }
 local skia = require("skia")
-local GdkPixbuf = require("lgi").GdkPixbuf
 local color, beautiful = nil, nil
 local gdebug = require("gears.debug")
 local hierarchy = require("wibox.hierarchy")

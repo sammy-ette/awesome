@@ -7,6 +7,7 @@
  */
 
 #include "render/skia/skia_lua.h"
+#include "render/skia/skia_xcb_lua.h"
 
 #include "render/skia/skia_backend.h"
 
@@ -533,13 +534,32 @@ sk_sp<SkFontMgr> font_manager()
     return manager;
 }
 
-SkFont text_font(const lua_skia_frame *frame)
+sk_sp<SkTypeface> text_typeface(const std::string &family, const SkFontStyle &style)
 {
+    /* Fontconfig family matching is much slower than constructing SkFont.
+     * The debug overlay and legacy show_text() path ask for the same face on
+     * every redraw, so keep the resolved typeface for the process lifetime. */
+    static std::unordered_map<std::string, sk_sp<SkTypeface>> cache;
+    const std::string key = family + "\n" +
+        std::to_string(style.weight()) + ":" +
+        std::to_string(style.width()) + ":" +
+        std::to_string(static_cast<int>(style.slant()));
+    auto cached = cache.find(key);
+    if (cached != cache.end())
+        return cached->second;
+
     sk_sp<SkTypeface> typeface;
     if (sk_sp<SkFontMgr> manager = font_manager())
-        typeface = manager->matchFamilyStyle(frame->state.font_family.c_str(),
-                                             frame->state.font_style);
+        typeface = manager->matchFamilyStyle(family.c_str(), style);
+    if (typeface)
+        cache.emplace(key, typeface);
+    return typeface;
+}
 
+SkFont text_font(const lua_skia_frame *frame)
+{
+    sk_sp<SkTypeface> typeface = text_typeface(frame->state.font_family,
+                                                frame->state.font_style);
     SkFont font(typeface, std::max(frame->state.font_size, 1.0f));
     font.setSubpixel(true);
     return font;
@@ -806,9 +826,12 @@ void draw_path(lua_skia_frame *frame, const SkPath &path, const SkPaint &paint)
 int skia_create_renderer(lua_State *L)
 {
     const int base = lua_istable(L, 1) ? 1 : 0;
-    const lua_Integer raw_window = luaL_checkinteger(L, base + 1);
-    const lua_Integer raw_width = luaL_checkinteger(L, base + 2);
-    const lua_Integer raw_height = luaL_checkinteger(L, base + 3);
+    const lua_Integer raw_window = static_cast<lua_Integer>(std::llround(
+        luaL_checknumber(L, base + 1)));
+    const lua_Integer raw_width = static_cast<lua_Integer>(std::llround(
+        luaL_checknumber(L, base + 2)));
+    const lua_Integer raw_height = static_cast<lua_Integer>(std::llround(
+        luaL_checknumber(L, base + 3)));
     if (raw_window <= 0 || static_cast<uint64_t>(raw_window) > UINT32_MAX)
         return luaL_argerror(L, base + 1, "expected an X11 window id");
     if (raw_width <= 0 || raw_height <= 0 ||
@@ -848,8 +871,10 @@ int renderer_resize(lua_State *L)
 {
     auto *renderer = static_cast<lua_skia_renderer *>(
         luaL_checkudata(L, 1, k_renderer_type));
-    const lua_Integer raw_width = luaL_checkinteger(L, 2);
-    const lua_Integer raw_height = luaL_checkinteger(L, 3);
+    const lua_Integer raw_width = static_cast<lua_Integer>(std::llround(
+        luaL_checknumber(L, 2)));
+    const lua_Integer raw_height = static_cast<lua_Integer>(std::llround(
+        luaL_checknumber(L, 3)));
     if (!renderer->renderer)
         return luaL_error(L, "Skia renderer has already been destroyed");
     if (raw_width <= 0 || raw_height <= 0 ||
@@ -1936,9 +1961,7 @@ int frame_show_text(lua_State *L)
         const char *family = luaL_optstring(L, 5, frame->state.font_family.c_str());
         const SkScalar size = std::max(static_cast<SkScalar>(luaL_optnumber(
             L, 6, frame->state.font_size)), 1.0f);
-        sk_sp<SkTypeface> typeface;
-        if (sk_sp<SkFontMgr> manager = font_manager())
-            typeface = manager->matchFamilyStyle(family, frame->state.font_style);
+        sk_sp<SkTypeface> typeface = text_typeface(family, frame->state.font_style);
         font = SkFont(typeface, size);
         font.setSubpixel(true);
     }
@@ -3593,6 +3616,7 @@ void register_skia_lua(lua_State *L, int skia_index)
     set_method(L, "create_renderer", skia_create_renderer);
     /* Explicit alias for callers that want to document the current WSI. */
     set_method(L, "create_xcb_renderer", skia_create_renderer);
+    awesome_skia_xcb_lua_register(L, lua_gettop(L));
     set_method(L, "begin", frame_begin);
     set_method(L, "stats", skia_stats);
     set_method(L, "is_canvas", skia_is_canvas);
